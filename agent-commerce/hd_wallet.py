@@ -23,11 +23,20 @@ from tronpy.keys import PrivateKey
 
 
 def load_mnemonic() -> str:
-    """从环境变量读取 master mnemonic(私钥级, 不落盘)。"""
+    """读取 master mnemonic(私钥级, 不落盘)。优先环境变量, 回退项目 .env 文件。"""
     m = os.environ.get("TRON_MASTER_MNEMONIC", "").strip()
-    if not m:
-        raise RuntimeError("TRON_MASTER_MNEMONIC 未配置")
-    return m
+    if m:
+        return m
+    # fallback: 读项目 .env 文件(systemd 走 EnvironmentFile, 手动跑时直接读文件)
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        import re
+        with open(env_path) as f:
+            for line in f:
+                mm = re.search(r'TRON_MASTER_MNEMONIC\s*=\s*["\']?(.+?)["\']?\s*$', line)
+                if mm:
+                    return mm.group(1).strip()
+    raise RuntimeError("TRON_MASTER_MNEMONIC 未配置")
 
 
 def derive_private_key(mnemonic: str, index: int) -> bytes:
