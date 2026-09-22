@@ -1,79 +1,73 @@
-# agent-commerce — AI 代理支付（x402 / A2A）
+# 千里眼情报简报 — 付费 AI 情报 agent（A2A + x402）
 
-> 让 Hermes agent 集群变成「可被其他 agent 付费调用」的服务。
-> 通过 A2A 协议发现 + x402 链上支付，按次收 TRON USDT。
+> 一个能被其他 agent 或人类「发现并付费调用」的投资情报服务。
+> 免费 Sample 验证质量，付费订阅拿每日最新 GO 级可落地方向。
 
 ---
 
-## 是什么
+## 一句话
 
-A2A（Agent2Agent）是 Google 主导的「agent 间互操作」开放协议，核心两步：
+读全球前沿信源（web3 / 美股 / 外汇 / AI），每天筛出**证据分级的 GO 级可落地方向**，按证据强弱交付，无料时诚实标注、不编内容。
 
-1. **发现**：`GET /.well-known/agent-card.json` 返回 Agent Card（技能清单 + 端点）。
-2. **调用**：`POST /a2a/v1`（JSON-RPC `message/send`），按需触发 x402 付费。
+## 免费 Sample（先验证质量，再付钱）
 
-x402 是 Coinbase 的 HTTP 402 链上支付标准，本实现用**自定义 TRON scheme**：
-买家按「唯一金额尾数」转 USDT（TRC-20）到收款地址，尾数即订单标识，无需 memo。
+一行 curl 直接拿历史 GO 信号完整版（免费，每 IP 7 天 1 次）：
 
-## 为什么选这条（三协议调研结论）
+```bash
+curl -s -X POST https://web3project.top/a2a/v1 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"sample"}'
+```
 
-| 协议 | 定位 | 结论 |
+Sample 返回**历史 GO 信号 + 证据级 + 分类**的完整一条，展示判断质量，不泄露最新时效（最新留付费）。
+
+## 定价（订阅制，不是按次卖）
+
+| 档位 | 价格 | 内容 |
 |---|---|---|
-| **x402 / A2A-x402** | agent 卖服务收款 | ✅ 首选，开源、免注册、免 KYC，个人可自助接入 |
-| ACP（Stripe×OpenAI） | agent 帮用户下单的电商结账 | ❌ 需 Stripe 商户 KYC + 禁售清单踩「无牌照金融产品」线 |
-| TAP（Visa） | 买家侧信任/鉴权层 | ❌ 需 Visa 注册发密钥，不解决「收钱」 |
+| Sample | 免费 | 历史 GO 信号完整版（7 天 1 次） |
+| 单期 | $9 | 单期简报快照 |
+| 周订 | $19 | 每日简报 · 7 天 |
+| 月订 | $49 | 每日简报 · 30 天（主力） |
 
-详见 `调研简报.md` 与 `references/` 一手规范。
+> 价值在「连续性」——今天的 GO 明天可能变 NO-GO，要跟踪，所以主力是订阅不是单次。
+
+## 怎么接入（A2A 协议）
+
+1. **发现**：`GET /.well-known/agent-card.json` 拿 Agent Card（技能 + 支付要求）
+2. **调用**：`POST /a2a/v1`（JSON-RPC `message/send`），发起购买
+3. **付款**：服务返回 payment-required，含**每订单独立 TRON 子地址** + 精确金额（$9/$19/$49）
+4. **交付**：到账后返回 completed + 当日情报简报
+
+收款走 TRON USDT（TRC-20），链上无 memo，独立地址架构归属无歧义。
+
+## 为什么是独立地址而非尾数匹配
+
+每订单从 HD 钱包（`m/44'/195'/0'/0/N`）派生独立子地址——**地址本身即订单标识**，不再需要「金额尾数」编码订单号，归属零歧义。子地址归集到主地址，全程链上可审计。
 
 ## 文件结构
 
 ```
 agent-commerce/
 ├── a2a_server.py      # A2A Merchant 服务（纯标准库，零依赖）
-├── agent-card.json    # A2A Agent Card v1.0（5 技能 + x402 扩展）
-├── 调研简报.md         # 三协议调研 + 落地判断
+├── agent-card.json    # A2A Agent Card v0.3.0（x402 扩展）
+├── sweep.py           # 子地址归集（充值/归集/TRX 回收，含孤儿扫描）
+├── reconcile.py       # 对账（自动认领已付款未回传凭证的订单）
+├── hd_wallet.py       # HD 派生（m/44'/195'/0'/0/N）
 └── references/        # 一手规范证据
 ```
 
-## 运行
+## 当前技能
 
-```bash
-# 直接跑（监听 8898）
-python3 a2a_server.py
+- `daily-intel-brief` — 每日前沿情报简报（**已实现付费闭环**）
+- 规划中：回测账本审计、机会尽调、策略盈利性审计、竞品监控
 
-# 或 systemd 常驻
-sudo cp a2a-agent.service ~/.config/systemd/user/  # 见部署说明
-systemctl --user enable --now a2a-agent
-```
+## 可靠性与安全
 
-## 端到端流程
+- 代码经 GPT-6 二十一轮审查收敛至「条件 GO」（无确定性资金/权益死路）。
+- 退款竞态、白嫖封顶、孤儿资金、充值恢复等 70+ 个资金状态机缺陷已闭环修复。
+- 真金白银操作走 `--execute` 显式开关，默认 dry-run。
 
-```
-1. 发现   GET  /.well-known/agent-card.json
-2. 调用   POST /a2a/v1  message/send  → 返回 input-required + 付款要求(USDT + 唯一尾数)
-3. 付费   买家转 5.x USDT 到收款地址
-4. 验证   服务查 TronGrid 按金额尾数匹配到账
-5. 交付   返回 completed + 情报简报(读情报库最新 GO 信号)
-```
+---
 
-## 收款配置
-
-在 `a2a_server.py` 顶部配置：
-
-- `RECEIVE_ADDRESS`：TRON USDT 收款地址
-- `USDT_CONTRACT`：USDT-TRC20 合约（TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t）
-- `PRICE_USD`：首个技能定价（默认 $5/次）
-
-## 当前技能（5 个）
-
-1. `daily-intel-brief` — 每日前沿情报简报（$5/次，已实现付费闭环）
-2. `backtest-accounting-audit` — 回测组合收益与资金账本审计
-3. `deal-screening-diligence` — 机会筛选与尽调
-4. `strategy-profitability-audit` — 策略盈利性审计
-5. `competitor-news-monitor` — 竞品重大新闻监控
-
-## 待办
-
-- [ ] 认领 a2a-registry.org 目录（当前 unclaimed，不影响调用）
-- [ ] 挂更多付费技能并分层定价
-- [ ] 主动向 A2A 生态外联获客
+**不构成投资建议**：本服务交付的是「证据分级的情报筛选」，不是买卖指令、不承诺收益。
