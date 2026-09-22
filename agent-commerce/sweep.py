@@ -193,14 +193,23 @@ def build_trx_transfer(client: Tron, from_addr: str, priv: bytes, to_addr: str, 
 
 
 def wait_for_result(client: Tron, txid: str, timeout: int = 90):
-    """轮询链上回执, 返回 (success: bool, receipt: dict|None)。广播成功 ≠ 执行成功。"""
+    """轮询链上回执, 返回 (success, receipt)。广播成功 ≠ 执行成功。
+
+    关键: 纯 TRX 转账的 receipt 无 result 键(只有 net_usage/net_fee), 顶层 result=='FAILED'
+    才是失败; 合约调用(USDT 归集)的 receipt.result 存在, 'SUCCESS' 才是成功。
+    若用 result=='SUCCESS' 统一判定, 会把成功的 TRX 充值误判为失败。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             info = client.get_transaction_info(txid)
-            if info and info.get("receipt"):
-                receipt = info["receipt"]
-                return receipt.get("result") == "SUCCESS", receipt
+            if info and (info.get("receipt") or info.get("blockNumber")):
+                receipt = info.get("receipt") or {}
+                res = receipt.get("result")
+                if res is not None:
+                    # 合约调用(USDT 归集): result 键存在, 按 SUCCESS 判定
+                    return res == "SUCCESS", receipt
+                # 纯 TRX 转账: 无 result 键, 顶层 result=='FAILED' 才是失败
+                return info.get("result") != "FAILED", receipt
         except Exception:
             pass
         time.sleep(3)
@@ -286,7 +295,7 @@ def _sweep_single(client: Tron, mnemonic: str, task_id: str, execute: bool) -> N
             ftx = fund_txn.txid
             # 广播前先持久化 fund_tx(防崩溃重跑重复充值, 与主循环幂等一致)
             with db_conn() as db:
-                db.execute("UPDATE orders SET fund_tx=? WHERE task_id=?", (ftx, task_id))
+                db.execute("UPDATE orders SET fund_tx=?, fund_at=? WHERE task_id=?", (ftx, _now_str(), task_id))
                 db.commit()
             fund_txn.broadcast()
             wait_for_result(client, ftx)
@@ -465,8 +474,13 @@ def main() -> None:
                 # 有充值记录但余额仍不足: 上次充值可能未上链(广播前崩溃/交易过期)
                 fexists = tx_exists(client, order["fund_tx"])
                 if fexists is False:
-                    log(f"FUND-RECOVER {tid}… 充值 tx={order['fund_tx'][:12]}… 链上查无此交易, 清 fund_tx 重新充")
-                    db.execute("UPDATE orders SET fund_tx=NULL WHERE task_id=?", (order["task_id"],))
+                    # "链上查不到" ≠ "交易已失效": TRON 交易有效期由 ref_block 决定(约 60s~数分钟)。
+                    # 只有 fund_at 超过安全缓冲(5min, 远超有效期)才清标记重充, 防未失效交易被误弃后重复出款。
+                    if _age_seconds(order["fund_at"]) < 300:
+                        log(f"FUND-HOLD {tid}… 充值 tx={order['fund_tx'][:12]}… 链上暂未查到(可能仍有效), 等待过期")
+                        continue
+                    log(f"FUND-RECOVER {tid}… 充值 tx={order['fund_tx'][:12]}… 链上查无此交易且已过有效期, 清 fund_tx 重新充")
+                    db.execute("UPDATE orders SET fund_tx=NULL, fund_at=NULL WHERE task_id=?", (order["task_id"],))
                     db.commit()
                     # 本轮跳过: order 是本轮读取的旧 Row, fund_tx 仍非空 → need_fund 仍 False,
                     # 若继续会用不足的 TRX 构建失败归集交易。下轮重新读 order(fund_tx=NULL) 再充值。
@@ -474,9 +488,13 @@ def main() -> None:
                 else:
                     # 已上链但余额仍不足: 区分"已确认执行失败"(TRX 转账 REVERT) vs "存在但到账延迟/未决"
                     ok_f, rcpt_f = wait_for_result(client, order["fund_tx"], timeout=15)
-                    if rcpt_f is not None and not ok_f:
-                        # 充值链上执行失败(REVERT): 清 fund_tx 重试(与 SWEEP-FAILED 同构, 防永久 FUND-HOLD)
-                        log(f"FUND-FAILED {tid}… 充值 tx={order['fund_tx'][:12]}… 链上执行失败(result={rcpt_f.get('result')}), 清 fund_tx 重试")
+                    # 只认「链上明确执行失败」: result 键存在且非 SUCCESS(纯 TRX 转账无 result 键, 不误判为失败)
+                    if rcpt_f is not None and not ok_f and rcpt_f.get("result") not in (None, "SUCCESS"):
+                        fund_fail_cnt = (order["payment_exception"] or "").count("FUND-FAILED:")
+                        if fund_fail_cnt >= 3:
+                            log(f"FUND-FAILED-HOLD {tid}… 连续 {fund_fail_cnt} 次充值执行失败, 转人工处理(保留 fund_tx, 停止重充)")
+                            continue
+                        log(f"FUND-FAILED {tid}… 充值 tx={order['fund_tx'][:12]}… 链上执行失败(result={rcpt_f.get('result')}), 清 fund_tx 重试({fund_fail_cnt+1}/3)")
                         db.execute(
                             "UPDATE orders SET fund_tx=NULL, "
                             "payment_exception = COALESCE(payment_exception || char(10), '') || ? WHERE task_id=?",
@@ -505,7 +523,7 @@ def main() -> None:
                 try:
                     fund_txn = build_trx_transfer(client, RECEIVE_ADDRESS, main_priv, from_addr, deficit)
                     ftx = fund_txn.txid  # 离线计算 txid, 广播前先落盘(防广播后崩溃导致重复充值)
-                    db.execute("UPDATE orders SET fund_tx=? WHERE task_id=?", (ftx, order["task_id"]))
+                    db.execute("UPDATE orders SET fund_tx=?, fund_at=? WHERE task_id=?", (ftx, _now_str(), order["task_id"]))
                     db.commit()
                     fr = fund_txn.broadcast()
                     log(f"TRX-FUND {tid}… tx={ftx} amount={deficit / 1e6:.2f}")
@@ -574,6 +592,18 @@ def main() -> None:
                         "payment_exception = 'ORPHAN-RE-ENTRY: ' || COALESCE(payment_exception,'') WHERE task_id=?",
                         (o["task_id"],))
                     db.commit()
+            else:
+                # USDT 已归集(余额 0 或尘埃), 检查残余 TRX 是否该回收(主循环回收失败后的补回收入口)
+                trx_rest = get_trx_balance(client, addr)
+                if trx_rest is not None and trx_rest > TRX_DUST_SUN:
+                    try:
+                        priv_o = hd_wallet.derive_private_key(mnemonic, o["address_index"])
+                        back = trx_rest - 1_100_000
+                        bt = build_trx_transfer(client, addr, priv_o, RECEIVE_ADDRESS, back)
+                        bt.broadcast()
+                        log(f"TRX-RECLAIM {o['task_id'][:12]}… 补回收 {back / 1e6:.2f} TRX")
+                    except Exception as e:
+                        log(f"TRX-RECLAIM FAIL {o['task_id'][:12]}…: {e}")
 
 
 if __name__ == "__main__":

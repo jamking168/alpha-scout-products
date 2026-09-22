@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS orders (
     sweep_tx       TEXT,                 -- 归集交易 txid
     sweep_at       TEXT,
     fund_tx        TEXT,                 -- TRX 充值交易 txid(幂等标记, 防重复充值)
+    fund_at        TEXT,                 -- fund_tx 落盘时间(判断充值交易是否已过 TRON 有效期, 防未失效重出款)
     sku            TEXT DEFAULT 'single', -- SKU(single/monthly/annual)
     access_until_ms INTEGER DEFAULT 0,    -- 订阅有效期截止毫秒(订阅订单才有值)
     last_deliver_day TEXT,                -- 订阅最近一次交付的自然日(按日频控用)
@@ -171,6 +172,8 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN sweep_at TEXT")
         if "fund_tx" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN fund_tx TEXT")
+        if "fund_at" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN fund_at TEXT")
         if "payment_exception" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN payment_exception TEXT")
         if "refund_requested_at" not in cols:
