@@ -57,8 +57,9 @@ PRICE_CENTS = {
     "monthly": 4900,     # $49 月订(30 天, 主力 SKU)
     "annual":  49000,    # $490 年订(365 天, 暂缓上架: 需先积累交付记录+续费观察)
 }
-EARLYBIRD_CENTS = 2900   # $29 早鸟月订锁价(前 50 名, 锁 6 个续费周期)
-EARLYBIRD_LIMIT = 50
+# 早鸟价(未实现, 禁止对外宣传): 锁价需要"锁价表+周期计数+续费系统", 实现前不得承诺
+# EARLYBIRD_CENTS = 2900   # $29 早鸟月订锁价(前 50 名, 锁 6 个续费周期)
+# EARLYBIRD_LIMIT = 50
 SKU_DAYS = {
     "single": 0,
     "weekly": 7,
@@ -72,6 +73,13 @@ SKU_NAME = {
     "monthly": "月订（每日简报 · 30 天）",
     "annual": "年订（每日简报 · 365 天）",
 }
+# 服务端禁售 SKU(年订暂缓: 需先积累交付记录+续费观察, 避免提前收取一年履约款)
+ENABLED_SKUS = {"single", "weekly", "monthly"}
+
+
+def _is_sub(sku: str) -> bool:
+    """统一订阅判定: SKU_DAYS[sku] > 0 即订阅(weekly/monthly/annual), 杜绝散落硬编码列表。"""
+    return SKU_DAYS.get(sku or DEFAULT_SKU, 0) > 0
 # 独立地址架构: 每订单一个 HD 派生子地址(m/44'/195'/0'/0/N), 替代共享地址+尾数匹配。
 # master mnemonic 从环境变量 TRON_MASTER_MNEMONIC 读取(私钥级, 不落盘, 开单时懒加载)。
 PAYMENT_WINDOW = 3600        # 付款窗口 60 分钟(TRON 出块 3s,手动转账+交易所提币常超时,15 分钟太紧)
@@ -514,7 +522,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_sample(self) -> dict:
         """免费 Sample: 返回最新 1 条 GO 信号完整版(不收款), 展示真实质量。每 IP 每 7 天 1 次。"""
-        ip = _ip_key(self.client_address[0])
+        ip = _ip_key(self._client_ip())  # 用 XFF 解析后的真实 IP, 反代后不能用 client_address[0](恒 127.0.0.1)
         key = f"sample:{ip}"
         now = time.time()
         if len(_SAMPLE_RATE) > 8192:  # 有界清理, 防无界内存增长
@@ -621,6 +629,12 @@ class Handler(BaseHTTPRequestHandler):
                     if row["status"] == "refunded":
                         self._send(200, _rpc_error(rid, -32007, "order refunded"))
                         return
+                    # 已交付则拒绝自助退款(防"既拿货又退款"): 走人工争议流程
+                    if (row["delivered_count"] or 0) > 0 or row["artifact"]:
+                        self._send(200, _rpc_result(rid, _working(
+                            row["task_id"],
+                            "订单已交付内容，自助退款通道不适用；如有争议请联系支持人工处理。")))
+                        return
                     db.execute(
                         "UPDATE orders SET refund_address=?, refund_requested_at=? "
                         "WHERE task_id=? AND status != 'refunded'",
@@ -638,13 +652,14 @@ class Handler(BaseHTTPRequestHandler):
                         row["task_id"], "订单处于退款审核中，暂停自动交付；请联系支持。")))
                     return
 
-                # 订阅订单(monthly/annual): 有效期内每次现取最新, 不固化快照
-                if (row["sku"] or "single") in ("monthly", "annual") and row["status"] == "paid":
+                # 订阅订单(weekly/monthly/annual): 有效期内每次现取最新, 不固化快照
+                if _is_sub(row["sku"]) and row["status"] == "paid":
                     if _now_ms() > (row["access_until_ms"] or 0):
                         self._send(200, _rpc_error(rid, -32011, "subscription expired, please renew"))
                         return
-                    # 年订总量封顶(防 payment_id 泄露后无限白嫖)
-                    if row["sku"] == "annual" and (row["delivered_count"] or 0) >= SUB_ANNUAL_TOTAL_LIMIT:
+                    # 订阅总量封顶(防 payment_id 泄露后无限白嫖): SKU_DAYS × 每日上限
+                    sub_total = SKU_DAYS.get(row["sku"] or DEFAULT_SKU, 0) * SUB_DAY_LIMIT
+                    if sub_total > 0 and (row["delivered_count"] or 0) >= sub_total:
                         self._send(200, _rpc_error(rid, -32010, "delivery limit reached; contact support"))
                         return
                     try:
@@ -652,13 +667,14 @@ class Handler(BaseHTTPRequestHandler):
                     except BriefUnavailable as e:
                         self._send(200, _rpc_result(rid, _working(row["task_id"], str(e))))
                         return
-                    # 按日频控(简报日更, 正常 1 次/天): 原子扣额度, 超限返回 429
+                    # 按日频控 + 退款/状态守卫: 原子扣额度, 超限/退款中返回(COALESCE 防 NULL 三值逻辑)
                     today = _now_str()[:10]
                     cur = db.execute(
                         "UPDATE orders SET "
-                        "day_deliver_count = CASE WHEN last_deliver_day = ? THEN day_deliver_count + 1 ELSE 1 END, "
+                        "day_deliver_count = CASE WHEN COALESCE(last_deliver_day,'') = ? THEN day_deliver_count + 1 ELSE 1 END, "
                         "last_deliver_day = ?, delivered_count = delivered_count + 1 "
-                        "WHERE task_id = ? AND (last_deliver_day != ? OR day_deliver_count < ?)",
+                        "WHERE task_id = ? AND status = 'paid' AND refund_requested_at IS NULL "
+                        "AND (COALESCE(last_deliver_day,'') <> ? OR day_deliver_count < ?)",
                         (today, today, row["task_id"], today, SUB_DAY_LIMIT))
                     if cur.rowcount == 0:
                         db.rollback()
@@ -671,12 +687,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 if row["status"] == "paid" and row["artifact"]:
-                    # 已固化内容: 幂等重取, 但设硬上限(payment_id 虽是 secret, 防 task_id 泄露路径的无限白嫖)
-                    if (row["delivered_count"] or 0) >= MAX_DELIVER:
+                    # 已固化内容: 幂等重取, 条件 UPDATE 加退款守卫 + 硬上限(原子, 防并发突破)
+                    cur = db.execute(
+                        "UPDATE orders SET delivered_count=delivered_count+1 "
+                        "WHERE task_id=? AND status='paid' AND refund_requested_at IS NULL "
+                        "AND delivered_count < ?",
+                        (row["task_id"], MAX_DELIVER))
+                    if cur.rowcount == 0:
+                        db.rollback()
                         self._send(200, _rpc_error(rid, -32010, "delivery limit reached; contact support"))
                         return
-                    db.execute("UPDATE orders SET delivered_count=delivered_count+1 WHERE task_id=?",
-                               (row["task_id"],))
                     db.commit()
                     self._send(200, _rpc_result(rid, _completed(
                         row["task_id"], row["artifact"],
@@ -798,7 +818,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, _rpc_result(rid, _working(row["task_id"], notice)))
                     return
                 # 固化交付物: 订阅订单不固化快照(每次现取最新), 单次订单固化 artifact
-                is_sub = (row["sku"] or "single") in ("monthly", "annual")
+                is_sub = _is_sub(row["sku"])
                 if is_sub:
                     cur2 = db.execute(
                         "UPDATE orders SET delivered_count=delivered_count+1, status='paid' "
@@ -903,6 +923,10 @@ class Handler(BaseHTTPRequestHandler):
                 sku = meta.get("x402.product") or DEFAULT_SKU
                 if sku not in PRICE_CENTS:
                     sku = DEFAULT_SKU
+                if sku not in ENABLED_SKUS:
+                    db.rollback()  # 禁售 SKU(年订) 明确拒绝, 不偷偷回退卖货
+                    self._send(200, _rpc_error(rid, -32004, f"SKU '{sku}' 暂未开放，请联系支持"))
+                    return
                 amount_cents = PRICE_CENTS[sku]
                 access_until_ms = 0  # 订阅有效期在付款确认时起算(见认领 SQL), 开单时仅占位
                 db.execute(

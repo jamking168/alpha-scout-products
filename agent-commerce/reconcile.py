@@ -18,8 +18,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from a2a_server import (  # noqa: E402
     DB_PATH,
+    DEFAULT_SKU,
     PAYMENT_WINDOW,
     LATE_PAY_GRACE,
+    SKU_DAYS,
     STATE_DIR,
     USDT_CONTRACT,
     _now_ms,
@@ -96,10 +98,13 @@ def main() -> None:
 
         if found:
             try:
+                # 订阅有效期从付款确认时刻起算(与 HTTP 认领一致, 防后台认领订阅被判过期)
+                sub_days = SKU_DAYS.get(order["sku"] or DEFAULT_SKU, 0)
+                new_until = _now_ms() + sub_days * 24 * 3600 * 1000 if sub_days > 0 else 0
                 cur = db.execute(
-                    "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=? "
+                    "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=?, access_until_ms=? "
                     "WHERE task_id=? AND status IN ('pending','expired') AND tx_hash IS NULL",
-                    (_now_str(), found, order["task_id"]),
+                    (_now_str(), found, new_until, order["task_id"]),
                 )
                 db.commit()
                 if cur.rowcount == 1:

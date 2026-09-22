@@ -100,6 +100,19 @@ def pending_orders(db):
     ).fetchall()
 
 
+def orphan_orders(db):
+    """孤儿扫描: 未认领(tx_hash IS NULL)但地址可能有余额的订单(付款超 7h 窗/对账漏扫导致)。
+
+    这类订单的地址上可能躺着真金白银却既不给货也不归集, 必须每天查一次余额并告警。"""
+    cutoff_ms = _now_ms() - 30 * 24 * 3600 * 1000
+    return db.execute(
+        "SELECT * FROM orders WHERE receive_address IS NOT NULL AND tx_hash IS NULL "
+        "AND status IN ('pending','expired') AND created_at_ms >= ? "
+        "AND (payment_exception IS NULL OR payment_exception NOT LIKE 'ORPHAN:%')",
+        (cutoff_ms,),
+    ).fetchall()
+
+
 def get_trx_balance(client: Tron, addr: str):
     """查 TRX 余额(sun)。返回 None 表示查询失败(不能当成余额 0)。"""
     try:
@@ -201,6 +214,17 @@ def main() -> None:
     client = Tron(HTTPProvider(endpoint_uri="https://api.trongrid.io"))
     with db_conn() as db:
         ensure_schema(db)
+        # 孤儿扫描: 未认领但地址有余额的订单(付款超窗/对账漏扫) → 告警, 不自动归集(归属未定, 人工决定)
+        for o in orphan_orders(db):
+            addr = o["receive_address"]
+            if not addr:
+                continue
+            bal = get_usdt_balance(client, addr)
+            if bal and bal > 0:
+                log(f"ORPHAN-ALERT: {o['task_id'][:12]}… addr={addr} 未认领但有 USDT 余额 {bal/1e6:.6f}, 人工决定补发/退款")
+                db.execute("UPDATE orders SET payment_exception=? WHERE task_id=?",
+                           ("ORPHAN: 有余额未认领", o["task_id"]))
+                db.commit()
         orders = pending_orders(db)
         if not orders:
             log("无待归集订单")
