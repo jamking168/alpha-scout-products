@@ -48,7 +48,7 @@ def main() -> None:
     db.execute("PRAGMA busy_timeout=8000")
     now_ms = _now_ms()
     orders = db.execute(
-        "SELECT * FROM orders WHERE status IN ('pending','expired') "
+        "SELECT * FROM orders WHERE status IN ('pending','expired','refund_requested') "
         "AND created_at_ms >= ?",
         (now_ms - LOOKBACK_MS,),
     ).fetchall()
@@ -97,6 +97,16 @@ def main() -> None:
             wrong = (txid, raw, tx.get("from", ""))
 
         if found:
+            if order["status"] == "refund_requested":
+                # 退款审核中到账: 只记录到账, 不认领(用户要退款不要货), 告警人工处理
+                db.execute(
+                    "UPDATE orders SET payment_exception = "
+                    "COALESCE(payment_exception || char(10), '') || ? "
+                    "WHERE task_id=? AND COALESCE(payment_exception,'') NOT LIKE '%REFUND-PAID%'",
+                    (f"REFUND-PAID: tx={found} 退款审核中到账, 人工核验后退款", order["task_id"]))
+                db.commit()
+                log(f"REFUND-PAID-ALERT: {tid}… tx {found[:12]}… 退款审核中到账, 人工核验")
+                continue
             try:
                 # 订阅有效期从付款确认时刻起算(与 HTTP 认领一致, 防后台认领订阅被判过期)
                 sub_days = SKU_DAYS.get(order["sku"] or DEFAULT_SKU, 0)

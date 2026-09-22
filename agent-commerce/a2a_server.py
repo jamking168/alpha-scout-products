@@ -692,7 +692,8 @@ class Handler(BaseHTTPRequestHandler):
                 # 订阅订单(weekly/monthly/annual): 有效期内每次现取最新, 不固化快照
                 if _is_sub(row["sku"]) and row["status"] == "paid":
                     if _now_ms() > (row["access_until_ms"] or 0):
-                        self._send(200, _rpc_error(rid, -32011, "subscription expired, please renew"))
+                        self._send(200, _rpc_error(rid, -32011,
+                                    "subscription expired; send a new message WITHOUT taskId to create a renewal order"))
                         return
                     # 订阅总量封顶(防 payment_id 泄露后无限白嫖): SKU_DAYS × 每日上限
                     sub_total = SKU_DAYS.get(row["sku"] or DEFAULT_SKU, 0) * SUB_DAY_LIMIT
@@ -744,11 +745,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, _rpc_error(rid, -32007, "order refunded"))
                     return
 
-                if row["status"] in ("paid", "paid_undelivered", "refund_requested"):
+                if row["status"] in ("paid", "paid_undelivered"):
                     # 订阅订单补发: 激活 status=paid, 现取最新 + 扣日额度(不固化快照, 与正常复取一致)
                     if _is_sub(row["sku"]):
                         if _now_ms() > (row["access_until_ms"] or 0):
-                            self._send(200, _rpc_error(rid, -32011, "subscription expired, please renew"))
+                            self._send(200, _rpc_error(rid, -32011,
+                                        "subscription expired; send a new message WITHOUT taskId to create a renewal order"))
                             return
                         try:
                             brief = gen_intel_brief()
@@ -760,7 +762,7 @@ class Handler(BaseHTTPRequestHandler):
                             "UPDATE orders SET status='paid', "
                             "day_deliver_count = CASE WHEN COALESCE(last_deliver_day,'') = ? THEN day_deliver_count + 1 ELSE 1 END, "
                             "last_deliver_day = ?, delivered_count = delivered_count + 1 "
-                            "WHERE task_id = ? AND status IN ('paid','paid_undelivered','refund_requested') "
+                            "WHERE task_id = ? AND status IN ('paid','paid_undelivered') "
                             "AND refund_requested_at IS NULL "
                             "AND (COALESCE(last_deliver_day,'') <> ? OR day_deliver_count < ?)",
                             (today, today, row["task_id"], today, SUB_DAY_LIMIT))
@@ -783,7 +785,7 @@ class Handler(BaseHTTPRequestHandler):
                     cur = db.execute(
                         "UPDATE orders SET status='paid', artifact=?, "
                         "paid_at=COALESCE(paid_at, ?), delivered_count=delivered_count+1 "
-                        "WHERE task_id=? AND status IN ('paid','paid_undelivered','refund_requested') "
+                        "WHERE task_id=? AND status IN ('paid','paid_undelivered') "
                         "AND artifact IS NULL AND refund_requested_at IS NULL",
                         (brief, _now_str(), row["task_id"]))
                     if cur.rowcount == 0:
@@ -927,16 +929,22 @@ class Handler(BaseHTTPRequestHandler):
                     if st == "refunded":
                         self._send(200, _rpc_error(rid, -32007, "order refunded"))
                         return
-                    # task_id 是公开标识(会进 trace/日志/relay), 只披露订单状态, 不交付内容。
-                    # 取货唯一凭证 = payment_id(144bit 高熵 secret); tx_hash 是公开链上数据, 不作身份证明。
-                    # 丢失 payment_id 走人工恢复(不提供 tx_hash 自助取货旁路)。
-                    if st in ("paid", "paid_undelivered", "refund_requested"):
-                        hint = "内容已就绪，请回传 paymentId 获取；丢失 paymentId 请联系支持人工恢复。"
-                    else:
-                        hint = "订单待付款，请付款后回传 paymentId 获取内容。"
-                    self._send(200, _rpc_result(rid, _working(client_task_id,
-                        f"订单状态: {st}。{hint}")))
-                    return
+                    # 订阅已过期: 放行开新单(续订死路修复)。否则用户带旧 taskId 续订时,
+                    # 会命中"订阅过期 -32011"提示但无续订路径, 形成无限重试死循环。
+                    sub_dead = (_is_sub(existing["sku"]) and st == "paid"
+                                and _now_ms() > (existing["access_until_ms"] or 0))
+                    if not sub_dead:
+                        # task_id 是公开标识(会进 trace/日志/relay), 只披露订单状态, 不交付内容。
+                        # 取货唯一凭证 = payment_id(144bit 高熵 secret); tx_hash 是公开链上数据, 不作身份证明。
+                        # 丢失 payment_id 走人工恢复(不提供 tx_hash 自助取货旁路)。
+                        if st in ("paid", "paid_undelivered", "refund_requested"):
+                            hint = "内容已就绪，请回传 paymentId 获取；丢失 paymentId 请联系支持人工恢复。"
+                        else:
+                            hint = "订单待付款，请付款后回传 paymentId 获取内容。"
+                        self._send(200, _rpc_result(rid, _working(client_task_id,
+                            f"订单状态: {st}。{hint}")))
+                        return
+                    # sub_dead: 订阅已过期, 落到下面正常开单流程(新 task_id / 新地址 / 新 payment_id)
 
             # 开单配额(DB 为准): 每 IP pending 上限 + 内存开单限流(辅助)
             ip_pend = db.execute("SELECT COUNT(*) FROM orders WHERE status='pending' AND creator_ip=?",

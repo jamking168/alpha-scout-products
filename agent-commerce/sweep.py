@@ -107,21 +107,22 @@ def orphan_orders(db):
     cutoff_ms = _now_ms() - 365 * 24 * 3600 * 1000  # 放宽到 1 年(资金滞留不应因窗口消失)
     return db.execute(
         "SELECT * FROM orders WHERE receive_address IS NOT NULL AND tx_hash IS NULL "
-        "AND status IN ('pending','expired') AND created_at_ms >= ? "
+        "AND status IN ('pending','expired','refund_requested') AND created_at_ms >= ? "
         "AND COALESCE(payment_exception,'') NOT LIKE 'ORPHAN_RESOLVED%'",
         (cutoff_ms,),
     ).fetchall()
 
 
 def recent_swept_orders(db):
-    """成功归集后 7 天内的地址, 复查是否再入账(重复付款/延迟到账的第二笔)。
+    """成功归集后 90 天内的地址, 复查是否再入账(重复付款/延迟到账的第二笔)。
 
-    不把"某次归集成功"解释为"这个地址终生不再有余额": 归集后仍有到账会重新打开归集。"""
+    不把"某次归集成功"解释为"这个地址终生不再有余额": 归集后仍有到账会重新打开归集。
+    90 天覆盖交易所提币风控 + 用户手动重复付款的长尾延迟(7 天会漏掉大额审核转账)。"""
     rows = db.execute(
-        "SELECT * FROM orders WHERE swept=1 AND sweep_tx NOT IN ('DUST','NO_BALANCE') "
+        "SELECT * FROM orders WHERE swept=1 AND sweep_tx != 'NO_BALANCE' "
         "AND sweep_at IS NOT NULL AND receive_address IS NOT NULL AND address_index IS NOT NULL"
     ).fetchall()
-    return [r for r in rows if _age_seconds(r["sweep_at"]) < 7 * 24 * 3600]
+    return [r for r in rows if _age_seconds(r["sweep_at"]) < 90 * 24 * 3600]
 
 
 def get_trx_balance(client: Tron, addr: str):
@@ -267,6 +268,10 @@ def _sweep_single(client: Tron, mnemonic: str, task_id: str, execute: bool) -> N
         try:
             fund_txn = build_trx_transfer(client, RECEIVE_ADDRESS, main_priv, addr, deficit)
             ftx = fund_txn.txid
+            # 广播前先持久化 fund_tx(防崩溃重跑重复充值, 与主循环幂等一致)
+            with db_conn() as db:
+                db.execute("UPDATE orders SET fund_tx=? WHERE task_id=?", (ftx, task_id))
+                db.commit()
             fund_txn.broadcast()
             wait_for_result(client, ftx)
             log(f"TRX-FUND {tid}… amount={deficit / 1e6:.2f}")
@@ -289,6 +294,10 @@ def _sweep_single(client: Tron, mnemonic: str, task_id: str, execute: bool) -> N
         with db_conn() as db:
             db.execute("UPDATE orders SET swept=1, sweep_tx=?, sweep_at=? WHERE task_id=?",
                        (txid, _now_str(), task_id))
+            # 审计痕迹: 孤儿已人工归集结案。前置 ORPHAN_RESOLVED 前缀, 使 orphan_orders 前缀匹配终结扫描
+            db.execute(
+                "UPDATE orders SET payment_exception = 'ORPHAN_RESOLVED: ' || COALESCE(payment_exception,'') || char(10) || ? WHERE task_id=?",
+                (f"手动归集 tx={txid} at={_now_str()}", task_id))
             db.commit()
         log(f"SWEPT {tid}… tx={txid} amount={bal / 1e6:.2f}")
     else:
@@ -348,9 +357,11 @@ def main() -> None:
             bal = get_usdt_balance(client, addr)
             if bal is None:
                 continue
-            if bal > 0:
+            # 只有超过尘埃阈值的余额才重开归集(尘埃不再重开, 避免"DUST→复查→又DUST"的每轮循环)
+            if bal > DUST_RAW:
                 log(f"RE-ENTRY-ALERT: {o['task_id'][:12]}… addr={addr} 已归集后再入账 {bal/1e6:.6f}, 重新打开归集")
-                db.execute("UPDATE orders SET swept=0, sweep_tx=NULL, sweep_at=NULL WHERE task_id=?",
+                # 一并清 fund_tx: 否则历史成功充值会阻塞新一轮充值(FUND-HOLD 永久卡死)
+                db.execute("UPDATE orders SET swept=0, sweep_tx=NULL, sweep_at=NULL, fund_tx=NULL WHERE task_id=?",
                            (o["task_id"],))
                 db.commit()
         orders = pending_orders(db)
@@ -380,17 +391,32 @@ def main() -> None:
                     db.commit()
                     log(f"RECONFIRM SWEPT {tid}… tx={order['sweep_tx'][:12]}… 上次已上链, 补记 swept")
                     continue
-                # 自动恢复: 广播后未上链(网络抖动/交易过期) → 链上查无此 tx 且超 5min, 清 sweep_tx 重走归集
-                exists = tx_exists(client, order["sweep_tx"])
-                if exists is False and _age_seconds(order["sweep_at"]) > 300:
-                    db.execute("UPDATE orders SET sweep_tx=NULL, sweep_at=NULL WHERE task_id=?",
-                               (order["task_id"],))
+                # 区分"已确认执行失败"(receipt 非 None 且 result != SUCCESS) vs "未决"(receipt None)
+                if receipt is not None:
+                    # 链上已确认执行失败(OUT_OF_ENERGY/REVERT): 记录 + 有界重试(最多 3 次, 防反复烧手续费)
+                    fail_cnt = (order["payment_exception"] or "").count("SWEEP-FAILED attempt")
+                    if fail_cnt >= 3:
+                        log(f"SWEEP-FAILED-HOLD {tid}… 连续 {fail_cnt} 次链上执行失败, 转人工处理(资源/权限核查)")
+                        continue
+                    log(f"SWEEP-FAILED {tid}… tx={order['sweep_tx'][:12]}… 链上执行失败(result={receipt.get('result')}), 清 sweep_tx 重试({fail_cnt+1}/3)")
+                    db.execute(
+                        "UPDATE orders SET sweep_tx=NULL, sweep_at=NULL, "
+                        "payment_exception = COALESCE(payment_exception || char(10), '') || ? WHERE task_id=?",
+                        (f"SWEEP-FAILED attempt: result={receipt.get('result')} at={_now_str()}", order["task_id"]))
                     db.commit()
-                    log(f"RECOVER {tid}… 上次归集 tx={order['sweep_tx'][:12]}… 链上查无此交易, 清 sweep_tx 重新归集")
-                    # 不 continue, 继续走下面正常归集流程
+                    # 不 continue, 继续走下面正常归集流程(重新查余额/充值/归集)
                 else:
-                    log(f"HOLD {tid}… 上次归集 tx={order['sweep_tx'][:12]}… 状态未知(存在={exists}), 人工核查")
-                    continue
+                    # 自动恢复: 广播后未上链(网络抖动/交易过期) → 链上查无此 tx 且超 5min, 清 sweep_tx 重走归集
+                    exists = tx_exists(client, order["sweep_tx"])
+                    if exists is False and _age_seconds(order["sweep_at"]) > 300:
+                        db.execute("UPDATE orders SET sweep_tx=NULL, sweep_at=NULL WHERE task_id=?",
+                                   (order["task_id"],))
+                        db.commit()
+                        log(f"RECOVER {tid}… 上次归集 tx={order['sweep_tx'][:12]}… 链上查无此交易, 清 sweep_tx 重新归集")
+                        # 不 continue, 继续走下面正常归集流程
+                    else:
+                        log(f"HOLD {tid}… 上次归集 tx={order['sweep_tx'][:12]}… 状态未知(存在={exists}), 人工核查")
+                        continue
             # 1. 查 USDT 实际余额(不是订单金额, 多付/重复付款都归集)
             bal = get_usdt_balance(client, from_addr)
             if bal is None:
@@ -433,6 +459,9 @@ def main() -> None:
                     log(f"FUND-RECOVER {tid}… 充值 tx={order['fund_tx'][:12]}… 链上查无此交易, 清 fund_tx 重新充")
                     db.execute("UPDATE orders SET fund_tx=NULL WHERE task_id=?", (order["task_id"],))
                     db.commit()
+                    # 本轮跳过: order 是本轮读取的旧 Row, fund_tx 仍非空 → need_fund 仍 False,
+                    # 若继续会用不足的 TRX 构建失败归集交易。下轮重新读 order(fund_tx=NULL) 再充值。
+                    continue
                 else:
                     # 已上链但余额仍不足(充值金额不够/到账延迟)或状态未知: 保守跳过本轮
                     log(f"FUND-HOLD {tid}… 充值 tx={order['fund_tx'][:12]}… 状态={fexists}, 保留待复核")
