@@ -50,7 +50,8 @@ RATE_LIMIT = 5              # 每 IP 每窗口请求数
 RATE_WINDOW = 60            # 限流窗口秒
 NEW_ORDER_LIMIT = 3         # 每 IP 每窗口「创建订单」配额(与通用 RPC 限流解耦)
 NEW_ORDER_WINDOW = 600      # 创建订单限流窗口秒(10 分钟)
-MAX_PENDING_GLOBAL = 60     # 全局 pending 订单上限,留 39 个尾数槽给真实买家
+MAX_PENDING_GLOBAL = 60     # 全局 pending 订单上限
+MAX_PENDING_PER_IP = 2      # 每 IP 同时 pending 订单上限(DB 为准,防单 IP 占槽)
 TRUSTED_PROXIES = {"127.0.0.1", "::1"}  # 可信反代来源(仅本机 Caddy)
 CHECK_COOLDOWN_MS = 20000   # 每订单到账查询冷却(防 TronGrid 被刷)
 LISTEN = ("127.0.0.1", 8898)
@@ -72,7 +73,8 @@ CREATE TABLE IF NOT EXISTS orders (
     artifact       TEXT,
     delivered_count INTEGER DEFAULT 0,
     refund_address TEXT,
-    last_check_ms  INTEGER DEFAULT 0
+    last_check_ms  INTEGER DEFAULT 0,
+    creator_ip     TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_tail_active
     ON orders(tail_cents) WHERE status='pending';
@@ -103,6 +105,8 @@ def init_db():
         cols = {r[1] for r in c.execute("PRAGMA table_info(orders)")}
         if "last_check_ms" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN last_check_ms INTEGER DEFAULT 0")
+        if "creator_ip" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN creator_ip TEXT")
         c.commit()
 
 
@@ -119,11 +123,8 @@ class BriefUnavailable(Exception):
 
 
 def gen_tail(db) -> int | None:
-    """从未过期且未占用的尾数中随机取一个；满则返回 None（触发 503 排队）。
-    本函数不 commit，由调用方在事务内控制；先回收过期订单。"""
-    now_ms = _now_ms()
-    db.execute("UPDATE orders SET status='expired' WHERE status='pending' AND expires_at_ms <= ?",
-               (now_ms,))
+    """从当前 pending 未占用的尾数中随机取一个；满则返回 None。
+    调用方须在 BEGIN IMMEDIATE 写事务内调用(过期回收由调用方先行执行)。"""
     used = {r[0] for r in db.execute("SELECT tail_cents FROM orders WHERE status='pending'")}
     free = [t for t in range(TAIL_MIN, TAIL_MAX + 1) if t not in used]
     if not free:
@@ -208,7 +209,7 @@ def check_payment(db, order) -> dict | None:
         expected_raw = target_cents * 10000
         if raw != expected_raw:
             continue
-        return {"tx_hash": txid, "amount_cents": target_cents}
+        return {"tx_hash": txid, "amount_cents": target_cents, "blk_ms": blk_ms}
     return None
 
 
@@ -322,6 +323,10 @@ _ORDER_RATE = {}
 def _allow_order(ip: str) -> bool:
     """开单限流(与通用 RPC 限流解耦,防匿名占满尾数槽)。"""
     now = time.time()
+    # 与 _RATE 同样做有界清理,防无界内存增长
+    if len(_ORDER_RATE) > 4096:
+        for k in [k for k, v in _ORDER_RATE.items() if not v or now - v[-1] > NEW_ORDER_WINDOW]:
+            _ORDER_RATE.pop(k, None)
     q = [t for t in _ORDER_RATE.get(ip, []) if now - t < NEW_ORDER_WINDOW]
     if len(q) >= NEW_ORDER_LIMIT:
         _ORDER_RATE[ip] = q
@@ -488,11 +493,17 @@ class Handler(BaseHTTPRequestHandler):
                         {"success": True, "transaction": row["tx_hash"], "network": "tron-mainnet"})))
                     return
 
-                # 每订单到账查询冷却(防 TronGrid 被刷)
-                if _now_ms() - (row["last_check_ms"] or 0) < CHECK_COOLDOWN_MS:
-                    self._send(200, _rpc_result(rid, _working(row["task_id"], "付款检测中,请稍后重试。")))
+                # 每订单到账查询冷却(原子认领,防并发一起通过)
+                now_ms = _now_ms()
+                cur_cool = db.execute(
+                    "UPDATE orders SET last_check_ms=? "
+                    "WHERE task_id=? AND status IN ('pending','expired') "
+                    "AND COALESCE(last_check_ms, 0) <= ?",
+                    (now_ms, row["task_id"], now_ms - CHECK_COOLDOWN_MS))
+                if cur_cool.rowcount != 1:
+                    db.rollback()
+                    self._send(200, _rpc_result(rid, _working(row["task_id"], "付款检测中或订单状态已变化,请稍后重试。")))
                     return
-                db.execute("UPDATE orders SET last_check_ms=? WHERE task_id=?", (_now_ms(), row["task_id"]))
                 db.commit()
 
                 hit = check_payment(db, row)
@@ -501,22 +512,32 @@ class Handler(BaseHTTPRequestHandler):
                         row["task_id"], "尚未检测到付款，请转账后重试。")))
                     return
 
-                # 原子认领(含过期订单补救): 写 paid_undelivered(已付款未交付),rowcount==0 说明被并发抢先
+                # 原子认领: BEGIN IMMEDIATE 写锁内复查 tx_hash 未被占用 + 条件更新
                 try:
+                    db.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError:
+                    self._send(503, _rpc_error(rid, -32003, "busy, retry later"))
+                    return
+                try:
+                    dup = db.execute("SELECT task_id FROM orders WHERE tx_hash=?", (hit["tx_hash"],)).fetchone()
+                    if dup:
+                        db.rollback()
+                        self._send(200, _rpc_error(rid, -32003, "payment already claimed by another order"))
+                        return
                     cur = db.execute(
                         "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=? "
-                        "WHERE task_id=? AND status IN ('pending','expired')",
+                        "WHERE task_id=? AND status IN ('pending','expired') AND tx_hash IS NULL",
                         (_now_str(), hit["tx_hash"], row["task_id"]))
+                    if cur.rowcount == 0:
+                        db.rollback()
+                        self._send(200, _rpc_error(rid, -32003, "payment already claimed"))
+                        return
+                    db.commit()
                 except sqlite3.IntegrityError:
                     db.rollback()
                     self._send(200, _rpc_error(rid, -32003, "payment already claimed by another order"))
                     return
-                if cur.rowcount == 0:
-                    db.rollback()
-                    self._send(200, _rpc_error(rid, -32003, "payment already claimed"))
-                    return
-                # 关键: 认领后立即 commit(先落账,再干活),把认领与交付拆成两个事务
-                db.commit()
+
                 # 生成并固化交付物;失败则保持 paid_undelivered(不返回占位)
                 try:
                     brief = gen_intel_brief()
@@ -525,27 +546,38 @@ class Handler(BaseHTTPRequestHandler):
                     if not isinstance(refund_addr, str):
                         refund_addr = ""
                     if refund_addr:
-                        db.execute("UPDATE orders SET status='refund_requested', refund_address=? "
-                                   "WHERE task_id=?", (refund_addr, row["task_id"]))
+                        cur_rf = db.execute(
+                            "UPDATE orders SET status='refund_requested', refund_address=? "
+                            "WHERE task_id=? AND tx_hash=? AND status='paid_undelivered' AND artifact IS NULL",
+                            (refund_addr, row["task_id"], hit["tx_hash"]))
+                        db.commit()
+                        if cur_rf.rowcount == 0:
+                            self._send(200, _rpc_result(rid, _working(row["task_id"], "订单状态已变化,请重试。")))
+                            return
                     # 无退款地址则保持 paid_undelivered(已是该状态,无需再写)
-                    db.commit()
                     notice = (f"付款已确认（tx {hit['tx_hash'][:12]}…），但内容源暂不可用：{e}。"
                               f"系统将补发；如需退款请回传 refundAddress。")
                     if refund_addr:
                         notice += f" 已收到退款地址 {refund_addr[:8]}…，退款待人工处理。"
                     self._send(200, _rpc_result(rid, _working(row["task_id"], notice)))
                     return
-                # 固化交付物: 条件更新(artifact IS NULL),并发下只允许写入一次
+                # 固化交付物: 条件更新(artifact IS NULL + 状态约束),并发下只允许写入一次
                 cur2 = db.execute(
-                    "UPDATE orders SET artifact=?, delivered_count=1, status='paid' "
-                    "WHERE task_id=? AND artifact IS NULL AND tx_hash IS NOT NULL",
-                    (brief, row["task_id"]))
+                    "UPDATE orders SET artifact=?, delivered_count=delivered_count+1, status='paid' "
+                    "WHERE task_id=? AND artifact IS NULL AND tx_hash=? "
+                    "AND status IN ('paid_undelivered','refund_requested')",
+                    (brief, row["task_id"], hit["tx_hash"]))
                 if cur2.rowcount == 0:
                     db.rollback()
-                    won = db.execute("SELECT artifact FROM orders WHERE task_id=?", (row["task_id"],)).fetchone()
+                    won = db.execute("SELECT status, artifact FROM orders WHERE task_id=?", (row["task_id"],)).fetchone()
+                    if won and won["status"] == "refunded":
+                        self._send(200, _rpc_error(rid, -32007, "order refunded"))
+                        return
                     if won and won["artifact"]:
                         brief = won["artifact"]
-                    # else: 极端并发下 artifact 未落库,仍返回本请求生成内容(下次可幂等重取)
+                    else:
+                        self._send(200, _rpc_error(rid, -32006, "order state changed, retry"))
+                        return
                 db.commit()
                 self._send(200, _rpc_result(rid, _completed(
                     row["task_id"], brief,
@@ -553,50 +585,111 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             # --- 分支2: 新请求 ---
-            # task_id 是公开标识,不是凭证。带 task_id 但无 payment_id 时,
-            # 不重新披露 payment_id、不返回 artifact(防凭证泄露/白嫖)。
+            # task_id 是公开标识(144bit 熵,不可枚举)。带 task_id 但无 payment_id 时:
+            # - 已付款订单: 允许凭 task_id 取货(不泄露 payment_id)——否则丢凭证的付费用户永久拿不到货
+            # - 未付款订单: 拒绝(不泄露 payment_id,防白嫖)
             if client_task_id:
                 existing = db.execute("SELECT * FROM orders WHERE task_id=?",
                                       (client_task_id,)).fetchone()
                 if existing:
+                    st = existing["status"]
+                    if st == "refunded":
+                        self._send(200, _rpc_error(rid, -32007, "order refunded"))
+                        return
+                    if st in ("paid", "paid_undelivered", "refund_requested"):
+                        # 已付款: 允许凭 task_id 取货(不回传 payment_id)
+                        if existing["artifact"]:
+                            db.execute("UPDATE orders SET delivered_count=delivered_count+1 WHERE task_id=?",
+                                       (client_task_id,))
+                            db.commit()
+                            self._send(200, _rpc_result(rid, _completed(
+                                client_task_id, existing["artifact"],
+                                {"success": True, "transaction": existing["tx_hash"],
+                                 "network": "tron-mainnet"})))
+                            return
+                        # 已付未交付: 走补发逻辑
+                        try:
+                            brief = gen_intel_brief()
+                        except BriefUnavailable as e:
+                            self._send(200, _rpc_result(rid, _working(client_task_id, str(e))))
+                            return
+                        cur = db.execute(
+                            "UPDATE orders SET status='paid', artifact=?, refund_address=NULL, "
+                            "paid_at=COALESCE(paid_at, ?), delivered_count=delivered_count+1 "
+                            "WHERE task_id=? AND status IN ('paid','paid_undelivered','refund_requested') "
+                            "AND artifact IS NULL",
+                            (brief, _now_str(), client_task_id))
+                        if cur.rowcount == 0:
+                            db.rollback()
+                            won = db.execute("SELECT artifact, tx_hash FROM orders WHERE task_id=?",
+                                             (client_task_id,)).fetchone()
+                            if won and won["artifact"]:
+                                self._send(200, _rpc_result(rid, _completed(
+                                    client_task_id, won["artifact"],
+                                    {"success": True, "transaction": won["tx_hash"],
+                                     "network": "tron-mainnet"})))
+                                return
+                            self._send(200, _rpc_error(rid, -32006, "order state changed, retry"))
+                            return
+                        db.commit()
+                        self._send(200, _rpc_result(rid, _completed(
+                            client_task_id, brief,
+                            {"success": True, "transaction": existing["tx_hash"],
+                             "network": "tron-mainnet"})))
+                        return
+                    # pending/expired: 未付款,不披露 payment_id
                     self._send(200, _rpc_error(rid, -32008,
-                        "order exists; resubmit with your paymentId to complete payment or claim"))
+                        "order exists and awaiting payment; resubmit with your paymentId"))
                     return
 
-            # 开单配额: 全局 pending 上限 + 每 IP 开单限流(与通用 RPC 限流解耦)
-            npend = db.execute("SELECT COUNT(*) FROM orders WHERE status='pending'").fetchone()[0]
-            if npend >= MAX_PENDING_GLOBAL:
-                self._send(503, _rpc_error(rid, -32004, "too many pending orders, retry later"))
+            # 开单配额(DB 为准): 每 IP pending 上限 + 内存开单限流(辅助)
+            ip_pend = db.execute("SELECT COUNT(*) FROM orders WHERE status='pending' AND creator_ip=?",
+                                 (ip,)).fetchone()[0]
+            if ip_pend >= MAX_PENDING_PER_IP:
+                self._send(429, _rpc_error(rid, -32005, "too many open orders from your address"))
                 return
             if not _allow_order(ip):
                 self._send(429, _rpc_error(rid, -32005, "new order rate limited"))
                 return
 
-            # 原子化: 唯一索引 ix_tail_active 是尾数冲突的最终防线,冲突则重试
-            task_id = payment_id = amount_cents = None
-            for _attempt in range(5):
-                tail_c = gen_tail(db)
-                if tail_c is None:
-                    db.rollback()
+            # 原子开单: BEGIN IMMEDIATE 内完成「回收过期 -> 计数 -> 分配尾数 -> 插入」
+            now_ms = _now_ms()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                self._send(503, _rpc_error(rid, -32004, "busy, retry later"))
+                return
+            try:
+                db.execute("UPDATE orders SET status='expired' WHERE status='pending' AND expires_at_ms <= ?",
+                           (now_ms,))
+                npend = db.execute("SELECT COUNT(*) FROM orders WHERE status='pending'").fetchone()[0]
+                if npend >= MAX_PENDING_GLOBAL:
+                    db.commit()  # 保留已完成的过期回收
+                    self._send(503, _rpc_error(rid, -32004, "too many pending orders, retry later"))
+                    return
+                used = {r[0] for r in db.execute("SELECT tail_cents FROM orders WHERE status='pending'")}
+                free = [t for t in range(TAIL_MIN, TAIL_MAX + 1) if t not in used]
+                if not free:
+                    db.commit()
                     self._send(503, _rpc_error(rid, -32004, "payment slots exhausted, retry later"))
                     return
+                tail_c = secrets.choice(free)
                 task_id = f"task-{secrets.token_urlsafe(24)}"
                 payment_id = f"pay-{secrets.token_urlsafe(24)}"
                 amount_cents = PRICE_CENTS + tail_c
-                now_ms = _now_ms()
-                try:
-                    db.execute(
-                        "INSERT INTO orders (task_id, payment_id, tail_cents, amount_cents, status, "
-                        "created_at_ms, expires_at_ms) VALUES (?,?,?,?,?,?,?)",
-                        (task_id, payment_id, tail_c, amount_cents, "pending",
-                         now_ms, now_ms + PAYMENT_WINDOW * 1000))
-                    db.commit()
-                    break
-                except sqlite3.IntegrityError:
-                    db.rollback()
-                    continue
-            else:
+                db.execute(
+                    "INSERT INTO orders (task_id, payment_id, tail_cents, amount_cents, status, "
+                    "created_at_ms, expires_at_ms, creator_ip) VALUES (?,?,?,?,?,?,?,?)",
+                    (task_id, payment_id, tail_c, amount_cents, "pending",
+                     now_ms, now_ms + PAYMENT_WINDOW * 1000, ip))
+                db.commit()
+            except sqlite3.IntegrityError:
+                db.rollback()
                 self._send(503, _rpc_error(rid, -32004, "payment slots exhausted, retry later"))
+                return
+            except sqlite3.OperationalError:
+                db.rollback()
+                self._send(503, _rpc_error(rid, -32004, "busy, retry later"))
                 return
             self._send(200, _rpc_result(rid, _payment_required(task_id, payment_id, amount_cents)))
 
