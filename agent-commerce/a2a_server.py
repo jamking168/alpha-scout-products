@@ -20,6 +20,7 @@ v2 修复（对应审查报告 P0）:
 - P0    请求体大小校验、幂等、每 IP 限流
 - P1    SQLite WAL + busy_timeout + 连接治理
 """
+import datetime
 import json
 import logging
 import os
@@ -47,6 +48,11 @@ MAX_BODY = 64 * 1024        # 请求体上限 64 KiB
 MAX_DELIVER = 3             # 单订单交付次数上限
 RATE_LIMIT = 5              # 每 IP 每窗口请求数
 RATE_WINDOW = 60            # 限流窗口秒
+NEW_ORDER_LIMIT = 3         # 每 IP 每窗口「创建订单」配额(与通用 RPC 限流解耦)
+NEW_ORDER_WINDOW = 600      # 创建订单限流窗口秒(10 分钟)
+MAX_PENDING_GLOBAL = 60     # 全局 pending 订单上限,留 39 个尾数槽给真实买家
+TRUSTED_PROXIES = {"127.0.0.1", "::1"}  # 可信反代来源(仅本机 Caddy)
+CHECK_COOLDOWN_MS = 20000   # 每订单到账查询冷却(防 TronGrid 被刷)
 LISTEN = ("127.0.0.1", 8898)
 
 log = logging.getLogger("a2a")
@@ -65,7 +71,8 @@ CREATE TABLE IF NOT EXISTS orders (
     tx_hash        TEXT UNIQUE,
     artifact       TEXT,
     delivered_count INTEGER DEFAULT 0,
-    refund_address TEXT
+    refund_address TEXT,
+    last_check_ms  INTEGER DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_tail_active
     ON orders(tail_cents) WHERE status='pending';
@@ -92,11 +99,19 @@ def db_conn(path=DB_PATH, readonly=False):
 def init_db():
     with db_conn() as c:
         c.executescript(SCHEMA)
+        # 迁移: 旧库补列(幂等)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(orders)")}
+        if "last_check_ms" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN last_check_ms INTEGER DEFAULT 0")
         c.commit()
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _now_str() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 class BriefUnavailable(Exception):
@@ -135,13 +150,15 @@ def gen_intel_brief() -> str:
     return "\n".join(lines)
 
 
-def fetch_incoming_since(min_ts_ms: int) -> list:
-    """查收款地址在 min_ts_ms 之后到账的 USDT-TRC20。min_timestamp 为毫秒。"""
+def fetch_incoming_since(min_ts_ms: int, max_ts_ms: int | None = None) -> list:
+    """查收款地址在 [min_ts_ms, max_ts_ms] 窗口内到账的 USDT-TRC20。"""
     url = (f"{TRON_API}/accounts/{RECEIVE_ADDRESS}/transactions/trc20"
            f"?only_confirmed=true&limit=200&contract_address={USDT_CONTRACT}"
            f"&min_timestamp={min_ts_ms}&order_by=block_timestamp,asc")
+    if max_ts_ms:
+        url += f"&max_timestamp={max_ts_ms}"
     req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with urllib.request.urlopen(req, timeout=8) as r:
         payload = json.load(r)
     if not payload.get("success", True):
         raise RuntimeError(f"trongrid error: {payload.get('error')}")
@@ -153,7 +170,7 @@ def check_payment(db, order) -> dict | None:
     target_cents = order["amount_cents"]
     created_ms = order["created_at_ms"]
     try:
-        txs = fetch_incoming_since(created_ms)
+        txs = fetch_incoming_since(created_ms, created_ms + PAYMENT_WINDOW * 1000)
     except Exception as e:
         log.warning("trongrid 查询失败: %s", e)
         return None
@@ -184,8 +201,11 @@ def check_payment(db, order) -> dict | None:
             raw = int(tx.get("value", "0"))
         except (ValueError, TypeError):
             continue
+        # 固定 USDT 精度为 6(不依赖上游 metadata 决定指数运算)
+        if dec != 6:
+            continue
         # 精确 raw 比较(不整除截断,杜绝少付 0.000001 也通过)
-        expected_raw = target_cents * (10 ** dec) // 100
+        expected_raw = target_cents * 10000
         if raw != expected_raw:
             continue
         return {"tx_hash": txid, "amount_cents": target_cents}
@@ -281,17 +301,33 @@ def _working(task_id: str, text: str) -> dict:
 _RATE = {}
 
 
-def _allow(ip: str) -> bool:
+def _allow(ip: str, limit: int = RATE_LIMIT, window: int = RATE_WINDOW) -> bool:
     now = time.time()
-    # 定期清理,防过期 IP 导致内存无限增长
-    if len(_RATE) > 1000:
-        _RATE.clear()
-    q = [t for t in _RATE.get(ip, []) if now - t < RATE_WINDOW]
-    if len(q) >= RATE_LIMIT:
+    # LRU 式清理: 只删真正过期的,不做全量 clear(防被利用重置限流)
+    if len(_RATE) > 4096:
+        for k in [k for k, v in _RATE.items() if not v or now - v[-1] > window]:
+            _RATE.pop(k, None)
+    q = [t for t in _RATE.get(ip, []) if now - t < window]
+    if len(q) >= limit:
         _RATE[ip] = q
         return False
     q.append(now)
     _RATE[ip] = q
+    return True
+
+
+_ORDER_RATE = {}
+
+
+def _allow_order(ip: str) -> bool:
+    """开单限流(与通用 RPC 限流解耦,防匿名占满尾数槽)。"""
+    now = time.time()
+    q = [t for t in _ORDER_RATE.get(ip, []) if now - t < NEW_ORDER_WINDOW]
+    if len(q) >= NEW_ORDER_LIMIT:
+        _ORDER_RATE[ip] = q
+        return False
+    q.append(now)
+    _ORDER_RATE[ip] = q
     return True
 
 
@@ -308,12 +344,15 @@ class Handler(BaseHTTPRequestHandler):
         log.info("%s %s", self.address_string(), fmt % args)
 
     def _client_ip(self) -> str:
-        # 服务只绑定 127.0.0.1,仅被本机 Caddy 反代(防火墙不对外开 8898)。
-        # 故 client_address 恒为 127.0.0.1,真实 IP 须从 Caddy 注入的 X-Forwarded-For 取。
-        xff = self.headers.get("X-Forwarded-For", "")
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0]
+        # 只有来自可信反代(本机 Caddy)的连接才采信 XFF;取最右一跳(Caddy 追加的,客户端不可伪造)。
+        peer = self.client_address[0]
+        if peer in TRUSTED_PROXIES:
+            xff = self.headers.get("X-Forwarded-For", "")
+            if xff:
+                parts = [p.strip() for p in xff.split(",") if p.strip()]
+                if parts:
+                    return parts[-1]
+        return peer
 
     def do_GET(self):
         if self.path.rstrip("/") == "/.well-known/agent-card.json":
@@ -405,9 +444,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 if row["status"] == "paid" and row["artifact"]:
-                    if row["delivered_count"] >= MAX_DELIVER:
-                        self._send(200, _rpc_error(rid, -32002, "delivery limit reached"))
-                        return
+                    # 已固化内容: 幂等重取(不设终身三次硬上限,防止网络重试被永久锁死)
                     db.execute("UPDATE orders SET delivered_count=delivered_count+1 WHERE task_id=?",
                                (row["task_id"],))
                     db.commit()
@@ -416,21 +453,47 @@ class Handler(BaseHTTPRequestHandler):
                         {"success": True, "transaction": row["tx_hash"], "network": "tron-mainnet"})))
                     return
 
-                if row["status"] in ("paid", "paid_undelivered"):
-                    # 已付款但未交付：尝试补发
+                if row["status"] == "refunded":
+                    self._send(200, _rpc_error(rid, -32007, "order refunded"))
+                    return
+
+                if row["status"] in ("paid", "paid_undelivered", "refund_requested"):
+                    # 已付款但未交付: 尝试补发(退款申请中也可补发,人工退款前先交付)
                     try:
                         brief = gen_intel_brief()
                     except BriefUnavailable as e:
                         self._send(200, _rpc_result(rid, _working(row["task_id"], str(e))))
                         return
-                    db.execute("UPDATE orders SET status='paid', artifact=?, paid_at=COALESCE(paid_at, ?) "
-                               "WHERE task_id=? AND tx_hash IS NOT NULL",
-                               (brief, _now_str(), row["task_id"]))
+                    # 条件更新: 只固化仍为空的 artifact,防并发覆盖 + 状态倒退
+                    cur = db.execute(
+                        "UPDATE orders SET status='paid', artifact=?, "
+                        "paid_at=COALESCE(paid_at, ?), delivered_count=delivered_count+1 "
+                        "WHERE task_id=? AND status IN ('paid','paid_undelivered','refund_requested') "
+                        "AND artifact IS NULL",
+                        (brief, _now_str(), row["task_id"]))
+                    if cur.rowcount == 0:
+                        # 并发下已有其他请求固化,读取获胜内容返回
+                        db.rollback()
+                        won = db.execute("SELECT artifact FROM orders WHERE task_id=?", (row["task_id"],)).fetchone()
+                        if won and won["artifact"]:
+                            self._send(200, _rpc_result(rid, _completed(
+                                row["task_id"], won["artifact"],
+                                {"success": True, "transaction": row["tx_hash"], "network": "tron-mainnet"})))
+                            return
+                        self._send(200, _rpc_error(rid, -32006, "order state changed, retry"))
+                        return
                     db.commit()
                     self._send(200, _rpc_result(rid, _completed(
                         row["task_id"], brief,
                         {"success": True, "transaction": row["tx_hash"], "network": "tron-mainnet"})))
                     return
+
+                # 每订单到账查询冷却(防 TronGrid 被刷)
+                if _now_ms() - (row["last_check_ms"] or 0) < CHECK_COOLDOWN_MS:
+                    self._send(200, _rpc_result(rid, _working(row["task_id"], "付款检测中,请稍后重试。")))
+                    return
+                db.execute("UPDATE orders SET last_check_ms=? WHERE task_id=?", (_now_ms(), row["task_id"]))
+                db.commit()
 
                 hit = check_payment(db, row)
                 if not hit:
@@ -438,10 +501,10 @@ class Handler(BaseHTTPRequestHandler):
                         row["task_id"], "尚未检测到付款，请转账后重试。")))
                     return
 
-                # 原子认领(含过期订单补救): 条件更新,rowcount==0 说明被并发抢先
+                # 原子认领(含过期订单补救): 写 paid_undelivered(已付款未交付),rowcount==0 说明被并发抢先
                 try:
                     cur = db.execute(
-                        "UPDATE orders SET status='paid', paid_at=?, tx_hash=? "
+                        "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=? "
                         "WHERE task_id=? AND status IN ('pending','expired')",
                         (_now_str(), hit["tx_hash"], row["task_id"]))
                 except sqlite3.IntegrityError:
@@ -454,7 +517,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 # 关键: 认领后立即 commit(先落账,再干活),把认领与交付拆成两个事务
                 db.commit()
-                # 生成并固化交付物；失败则记为 paid_undelivered,不返回占位
+                # 生成并固化交付物;失败则保持 paid_undelivered(不返回占位)
                 try:
                     brief = gen_intel_brief()
                 except BriefUnavailable as e:
@@ -464,40 +527,50 @@ class Handler(BaseHTTPRequestHandler):
                     if refund_addr:
                         db.execute("UPDATE orders SET status='refund_requested', refund_address=? "
                                    "WHERE task_id=?", (refund_addr, row["task_id"]))
-                    else:
-                        db.execute("UPDATE orders SET status='paid_undelivered' WHERE task_id=?",
-                                   (row["task_id"],))
+                    # 无退款地址则保持 paid_undelivered(已是该状态,无需再写)
                     db.commit()
-                    msg = (f"付款已确认（tx {hit['tx_hash'][:12]}…），但内容源暂不可用：{e}。"
-                           f"系统将补发；如需退款请回传 refundAddress。")
+                    notice = (f"付款已确认（tx {hit['tx_hash'][:12]}…），但内容源暂不可用：{e}。"
+                              f"系统将补发；如需退款请回传 refundAddress。")
                     if refund_addr:
-                        msg += f" 已收到退款地址 {refund_addr[:8]}…，退款待人工处理。"
-                    self._send(200, _rpc_result(rid, _working(row["task_id"], msg)))
+                        notice += f" 已收到退款地址 {refund_addr[:8]}…，退款待人工处理。"
+                    self._send(200, _rpc_result(rid, _working(row["task_id"], notice)))
                     return
-                db.execute("UPDATE orders SET artifact=?, delivered_count=1 WHERE task_id=?",
-                           (brief, row["task_id"]))
+                # 固化交付物: 条件更新(artifact IS NULL),并发下只允许写入一次
+                cur2 = db.execute(
+                    "UPDATE orders SET artifact=?, delivered_count=1, status='paid' "
+                    "WHERE task_id=? AND artifact IS NULL AND tx_hash IS NOT NULL",
+                    (brief, row["task_id"]))
+                if cur2.rowcount == 0:
+                    db.rollback()
+                    won = db.execute("SELECT artifact FROM orders WHERE task_id=?", (row["task_id"],)).fetchone()
+                    if won and won["artifact"]:
+                        brief = won["artifact"]
+                    # else: 极端并发下 artifact 未落库,仍返回本请求生成内容(下次可幂等重取)
                 db.commit()
                 self._send(200, _rpc_result(rid, _completed(
                     row["task_id"], brief,
                     {"success": True, "transaction": hit["tx_hash"], "network": "tron-mainnet"})))
                 return
 
-            # --- 分支2: 新请求 -> 幂等 -> 返回付款要求 ---
-            # 幂等：若客户端带 taskId 且订单存在，返回同一张单
+            # --- 分支2: 新请求 ---
+            # task_id 是公开标识,不是凭证。带 task_id 但无 payment_id 时,
+            # 不重新披露 payment_id、不返回 artifact(防凭证泄露/白嫖)。
             if client_task_id:
                 existing = db.execute("SELECT * FROM orders WHERE task_id=?",
                                       (client_task_id,)).fetchone()
                 if existing:
-                    if existing["status"] == "pending" and existing["expires_at_ms"] > _now_ms():
-                        self._send(200, _rpc_result(rid, _payment_required(
-                            existing["task_id"], existing["payment_id"], existing["amount_cents"])))
-                        return
-                    if existing["status"] in ("paid",) and existing["artifact"]:
-                        self._send(200, _rpc_result(rid, _completed(
-                            existing["task_id"], existing["artifact"],
-                            {"success": True, "transaction": existing["tx_hash"],
-                             "network": "tron-mainnet"})))
-                        return
+                    self._send(200, _rpc_error(rid, -32008,
+                        "order exists; resubmit with your paymentId to complete payment or claim"))
+                    return
+
+            # 开单配额: 全局 pending 上限 + 每 IP 开单限流(与通用 RPC 限流解耦)
+            npend = db.execute("SELECT COUNT(*) FROM orders WHERE status='pending'").fetchone()[0]
+            if npend >= MAX_PENDING_GLOBAL:
+                self._send(503, _rpc_error(rid, -32004, "too many pending orders, retry later"))
+                return
+            if not _allow_order(ip):
+                self._send(429, _rpc_error(rid, -32005, "new order rate limited"))
+                return
 
             # 原子化: 唯一索引 ix_tail_active 是尾数冲突的最终防线,冲突则重试
             task_id = payment_id = amount_cents = None
@@ -526,11 +599,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(503, _rpc_error(rid, -32004, "payment slots exhausted, retry later"))
                 return
             self._send(200, _rpc_result(rid, _payment_required(task_id, payment_id, amount_cents)))
-
-
-def _now_str():
-    import datetime
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def main():

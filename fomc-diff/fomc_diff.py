@@ -236,13 +236,16 @@ def extract_statement_text(html_bytes):
 
 
 def fetch_statement(date_str):
-    """按日期抓声明,探测 a/b/c 后缀,返回 (url, text) 或 (None, None)。"""
+    """按日期抓声明,探测 a/b/c/d 后缀,返回 (url, text) 或 (None, None)。
+    只有正文抽取成功才返回,否则继续探测后续后缀(避免拿到 200 但非声明正文)。"""
     d = date_str.replace("-", "")
-    for suffix in ("a", "b", "c"):
+    for suffix in ("a", "b", "c", "d"):
         url = f"{FED_PR_BASE}/monetary{d}{suffix}.htm"
         st, body = http_get(url, ua=UA_WEB)
         if st == 200 and body:
-            return url, extract_statement_text(body)
+            txt = extract_statement_text(body)
+            if txt:
+                return url, txt
     return None, None
 
 
@@ -342,19 +345,12 @@ def _clean(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _validate_sep(years, frow):
-    """校验 SEP 解析结果;通过返回 True,否则 False(宁可不输出,不输出错数字)。"""
+def _valid_rate_cells(cells):
+    """校验一组利率单元格(5 个值)是否合法;合法返回 True。"""
     import re
-    if not years or len(years) < 5:
+    if len(cells) < 5:
         return False
-    if not all(re.match(r"^\d{4}$", str(y).strip()) for y in years[:4]):
-        return False
-    if "longer" not in str(years[4]).lower():
-        return False
-    vals = frow[1:6] if len(frow) >= 6 else []
-    if len(vals) < 5:
-        return False
-    for v in vals:
+    for v in cells:
         s = str(v).strip().replace("%", "")
         if not re.match(r"^\d(\.\d{1,2})?$", s):
             return False
@@ -365,6 +361,18 @@ def _validate_sep(years, frow):
         if not (0.0 <= f <= 10.0):
             return False
     return True
+
+
+def _validate_sep(years, frow):
+    """校验 SEP 解析结果;通过返回 True,否则 False(宁可不输出,不输出错数字)。"""
+    import re
+    if not years or len(years) < 5:
+        return False
+    if not all(re.match(r"^\d{4}$", str(y).strip()) for y in years[:4]):
+        return False
+    if "longer" not in str(years[4]).lower():
+        return False
+    return _valid_rate_cells(frow[1:6] if len(frow) >= 6 else [])
 
 
 def fetch_sep_median(date_str):
@@ -400,6 +408,9 @@ def fetch_sep_median(date_str):
                 first = str(june_row[0]).strip().lower() if june_row else ""
                 if not any(m in first for m in ("june", "jun", "sep", "dec", "mar", "march", "year", "month")):
                     june_row = None
+            # june 行数值也须通过利率格式校验,否则置 None(防止把错误行当上次中位数)
+            if june_row is not None and not _valid_rate_cells(june_row[1:6] if len(june_row) >= 6 else []):
+                june_row = None
             if not _validate_sep(years, frow):
                 return {
                     "url": url,
