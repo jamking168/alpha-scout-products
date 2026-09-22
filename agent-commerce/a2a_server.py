@@ -157,17 +157,26 @@ def gen_intel_brief() -> str:
     try:
         with db_conn(path=INTEL_DB, readonly=True) as c:
             rows = c.execute(
-                "SELECT date, memo_title, category FROM intel_memo "
-                "WHERE verdict='GO' ORDER BY created_at DESC LIMIT 6"
+                "SELECT date, memo_title, category, evidence_grade, body "
+                "FROM intel_memo WHERE verdict='GO' ORDER BY created_at DESC LIMIT 6"
             ).fetchall()
     except Exception as e:
         raise BriefUnavailable(f"情报库读取失败: {e}") from e
     if not rows:
         raise BriefUnavailable("当前无可交付的 GO 级信号")
-    lines = ["## 千里眼 · 每日情报简报", "", "### 当前 GO 级信号（可落地方向）"]
-    for r in rows:
-        lines.append(f"- [{r['category'] or 'N/A'}] {r['memo_title']}（{r['date']}）")
-    lines += ["", "---", "本简报由千里眼 agent 集群自动生成，不构成投资建议。"]
+    lines = ["## 千里眼 · 每日情报简报", "", "### 当前 GO 级信号（可落地方向）", ""]
+    for i, r in enumerate(rows, 1):
+        title = (r['memo_title'] or '').strip()
+        grade = r['evidence_grade'] or '未分级'
+        cat = r['category'] or 'N/A'
+        lines.append(f"### {i}. {title}")
+        lines.append(f"*{cat} · 证据级 {grade} · {r['date']}*")
+        body = (r['body'] or '').strip()
+        if body:
+            lines.append("")
+            lines.append(body)
+        lines.append("")
+    lines += ["---", "本简报由千里眼 agent 集群自动生成，不构成投资建议。"]
     return "\n".join(lines)
 
 
