@@ -52,20 +52,23 @@ TRON_ADDR_RE = __import__("re").compile(r'^T[1-9A-HJ-NP-Za-km-z]{33}$')  # TRON 
 # 体系(固定): 免费 Sample / 单期 Single / 月订 Monthly / 年订 Annual / 定制 Custom
 # 用户只调下面各数字, 不改分层结构。
 PRICE_CENTS = {
-    "single":  1900,     # $19 单期(试用入口, 30 天内升级月订可抵扣)
-    "monthly": 12900,    # $129 月订(主力 SKU)
-    "annual":  129000,   # $1,290 年订(等效 $107.5/月)
+    "single":  900,      # $9 单期(指定日期快照, 试用入口)
+    "weekly":  1900,     # $19 周订(7 天, 判断"每天是否有料"的关键试用层)
+    "monthly": 4900,     # $49 月订(30 天, 主力 SKU)
+    "annual":  49000,    # $490 年订(365 天, 暂缓上架: 需先积累交付记录+续费观察)
 }
-EARLYBIRD_CENTS = 9900   # $99 早鸟月订(前 30 名, 运营层, 不属 SKU 体系)
-EARLYBIRD_LIMIT = 30
-SKU_DAYS = {             # 各 SKU 有效期(天); 0 = 按次(固化快照)
+EARLYBIRD_CENTS = 2900   # $29 早鸟月订锁价(前 50 名, 锁 6 个续费周期)
+EARLYBIRD_LIMIT = 50
+SKU_DAYS = {
     "single": 0,
+    "weekly": 7,
     "monthly": 30,
     "annual": 365,
 }
 DEFAULT_SKU = "single"
-SKU_NAME = {             # SKU 展示名(仅文案用)
-    "single": "单期简报",
+SKU_NAME = {
+    "single": "单期简报（指定日期快照）",
+    "weekly": "周订（每日简报 · 7 天）",
     "monthly": "月订（每日简报 · 30 天）",
     "annual": "年订（每日简报 · 365 天）",
 }
@@ -75,6 +78,8 @@ PAYMENT_WINDOW = 3600        # 付款窗口 60 分钟(TRON 出块 3s,手动转�
 LATE_PAY_GRACE = 6 * 3600    # 迟到付款宽限 6 小时(交易所 TRC20 提币经风控审核常超 1 小时, 过期后到账仍需可认领)
 MAX_BODY = 64 * 1024        # 请求体上限 64 KiB
 MAX_DELIVER = 5             # 单订单交付次数硬上限(含网络重试余量; 防 task_id 泄露无限白嫖)
+SUB_DAY_LIMIT = 3           # 订阅每日交付上限(简报日更, 正常 1 次/天; 防 payment_id 泄露无限白嫖)
+SUB_ANNUAL_TOTAL_LIMIT = 365 * 3  # 年订总量封顶(365 天 × 每日 3 次)
 RATE_LIMIT = 5              # 每 IP 每窗口请求数
 RATE_WINDOW = 60            # 限流窗口秒
 NEW_ORDER_LIMIT = 3         # 每 IP 每窗口「创建订单」配额(与通用 RPC 限流解耦)
@@ -110,7 +115,9 @@ CREATE TABLE IF NOT EXISTS orders (
     sweep_at       TEXT,
     fund_tx        TEXT,                 -- TRX 充值交易 txid(幂等标记, 防重复充值)
     sku            TEXT DEFAULT 'single', -- SKU(single/monthly/annual)
-    access_until_ms INTEGER DEFAULT 0     -- 订阅有效期截止毫秒(订阅订单才有值)
+    access_until_ms INTEGER DEFAULT 0,    -- 订阅有效期截止毫秒(订阅订单才有值)
+    last_deliver_day TEXT,                -- 订阅最近一次交付的自然日(按日频控用)
+    day_deliver_count INTEGER DEFAULT 0    -- 订阅当日交付次数(按日频控, 防 payment_id 泄露无限白嫖)
 );
 CREATE TABLE IF NOT EXISTS hd_counter (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -165,6 +172,10 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN sku TEXT DEFAULT 'single'")
         if "access_until_ms" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN access_until_ms INTEGER DEFAULT 0")
+        if "last_deliver_day" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN last_deliver_day TEXT")
+        if "day_deliver_count" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN day_deliver_count INTEGER DEFAULT 0")
         # 迁移完成后再建索引(先补列再建索引, 避免旧库无列时报错)
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_addr_unique ON orders(receive_address)")
         # 旧架构迁移: 无独立地址的旧 pending 订单作废(旧共享地址+尾数架构已废弃)
@@ -236,6 +247,31 @@ def gen_intel_brief() -> str:
             lines.append(body)
         lines.append("")
     lines += ["---", "本简报由千里眼 agent 集群自动生成，不构成投资建议。"]
+    return "\n".join(lines)
+
+
+def gen_sample_brief() -> str:
+    """免费 Sample: 最新 1 条 GO 信号的完整版(证据链 + 赚钱路径), 展示真实质量。不是删减版标题。"""
+    try:
+        with db_conn(path=INTEL_DB, readonly=True) as c:
+            row = c.execute(
+                "SELECT date, memo_title, category, evidence_grade, body "
+                "FROM intel_memo WHERE verdict='GO' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+    except Exception as e:
+        raise BriefUnavailable(f"情报库读取失败: {e}") from e
+    if not row:
+        raise BriefUnavailable("当前无可交付的 GO 级信号")
+    title = (row['memo_title'] or '').strip()
+    grade = row['evidence_grade'] or '未分级'
+    cat = row['category'] or 'N/A'
+    body = (row['body'] or '').strip()
+    lines = ["## 千里眼 · 免费样报（最新 1 条 GO 信号 · 完整版）", "",
+             f"### {title}", f"*{cat} · 证据级 {grade} · {row['date']}*", "", body, "",
+             "---",
+             "这是免费样报（1 条完整信号，含证据链与落地路径）。",
+             "订阅可获取每日最新 6 条 GO 信号 + 持续跟踪 + 历史。",
+             "本简报由千里眼 agent 集群自动生成，不构成投资建议。"]
     return "\n".join(lines)
 
 
@@ -421,6 +457,9 @@ def _allow(ip: str, limit: int = RATE_LIMIT, window: int = RATE_WINDOW) -> bool:
 
 _ORDER_RATE = {}
 
+_SAMPLE_RATE = {}            # 免费样报内存限流(每 IP 每 SAMPLE_COOLDOWN 秒 1 次, 有界)
+SAMPLE_COOLDOWN = 7 * 24 * 3600  # 免费样报冷却 7 天
+
 
 def _allow_order(ip: str) -> bool:
     """开单限流(与通用 RPC 限流解耦,防匿名占满尾数槽)。"""
@@ -473,6 +512,24 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not found"})
 
+    def _handle_sample(self) -> dict:
+        """免费 Sample: 返回最新 1 条 GO 信号完整版(不收款), 展示真实质量。每 IP 每 7 天 1 次。"""
+        ip = _ip_key(self.client_address[0])
+        key = f"sample:{ip}"
+        now = time.time()
+        if len(_SAMPLE_RATE) > 8192:  # 有界清理, 防无界内存增长
+            for k in [k for k, v in _SAMPLE_RATE.items() if now - v > SAMPLE_COOLDOWN]:
+                _SAMPLE_RATE.pop(k, None)
+        last = _SAMPLE_RATE.get(key, 0)
+        if now - last < SAMPLE_COOLDOWN:
+            return _working("sample", "免费样报每 7 天可领取 1 次，请稍后再试；或直接订阅获取每日最新。")
+        try:
+            brief = gen_sample_brief()
+        except BriefUnavailable as e:
+            return _working("sample", f"免费样报暂不可用：{e}")
+        _SAMPLE_RATE[key] = now
+        return _completed("sample", brief, {"success": True, "free": True})
+
     def do_POST(self):
         ip = _ip_key(self._client_ip())
         if not _allow(ip):
@@ -507,6 +564,10 @@ class Handler(BaseHTTPRequestHandler):
 
         rid = req.get("id")
         method = req.get("method")
+        if method == "sample":
+            # 免费 Sample: 返回昨日完整简报(不收款), 展示真实质量 = 唯一信任货币
+            self._send(200, _rpc_result(rid, self._handle_sample()))
+            return
         if method != "message/send":
             self._send(200, _rpc_error(rid, -32601, f"unsupported method: {method}"))
             return
@@ -582,13 +643,27 @@ class Handler(BaseHTTPRequestHandler):
                     if _now_ms() > (row["access_until_ms"] or 0):
                         self._send(200, _rpc_error(rid, -32011, "subscription expired, please renew"))
                         return
+                    # 年订总量封顶(防 payment_id 泄露后无限白嫖)
+                    if row["sku"] == "annual" and (row["delivered_count"] or 0) >= SUB_ANNUAL_TOTAL_LIMIT:
+                        self._send(200, _rpc_error(rid, -32010, "delivery limit reached; contact support"))
+                        return
                     try:
                         brief = gen_intel_brief()
                     except BriefUnavailable as e:
                         self._send(200, _rpc_result(rid, _working(row["task_id"], str(e))))
                         return
-                    db.execute("UPDATE orders SET delivered_count=delivered_count+1 WHERE task_id=?",
-                               (row["task_id"],))
+                    # 按日频控(简报日更, 正常 1 次/天): 原子扣额度, 超限返回 429
+                    today = _now_str()[:10]
+                    cur = db.execute(
+                        "UPDATE orders SET "
+                        "day_deliver_count = CASE WHEN last_deliver_day = ? THEN day_deliver_count + 1 ELSE 1 END, "
+                        "last_deliver_day = ?, delivered_count = delivered_count + 1 "
+                        "WHERE task_id = ? AND (last_deliver_day != ? OR day_deliver_count < ?)",
+                        (today, today, row["task_id"], today, SUB_DAY_LIMIT))
+                    if cur.rowcount == 0:
+                        db.rollback()
+                        self._send(200, _rpc_error(rid, 429, "daily delivery limit reached; try again tomorrow"))
+                        return
                     db.commit()
                     self._send(200, _rpc_result(rid, _completed(
                         row["task_id"], brief,
@@ -695,10 +770,13 @@ class Handler(BaseHTTPRequestHandler):
                         db.rollback()
                         self._send(200, _rpc_error(rid, -32003, "payment already claimed by another order"))
                         return
+                    # 订阅有效期从付款确认时刻起算(而非开单时刻, 避免迟到付款吃掉用户已购天数)
+                    sub_days = SKU_DAYS.get(row["sku"] or "single", 0)
+                    new_until = _now_ms() + sub_days * 24 * 3600 * 1000 if sub_days > 0 else 0
                     cur = db.execute(
-                        "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=? "
+                        "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=?, access_until_ms=? "
                         "WHERE task_id=? AND status IN ('pending','expired') AND tx_hash IS NULL",
-                        (_now_str(), hit["tx_hash"], row["task_id"]))
+                        (_now_str(), hit["tx_hash"], new_until, row["task_id"]))
                     if cur.rowcount == 0:
                         db.rollback()
                         self._send(200, _rpc_error(rid, -32003, "payment already claimed"))
@@ -713,23 +791,10 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     brief = gen_intel_brief()
                 except BriefUnavailable as e:
-                    refund_addr = payload.get("refundAddress", "")
-                    if not isinstance(refund_addr, str):
-                        refund_addr = ""
-                    if refund_addr:
-                        cur_rf = db.execute(
-                            "UPDATE orders SET status='refund_requested', refund_address=? "
-                            "WHERE task_id=? AND tx_hash=? AND status='paid_undelivered' AND artifact IS NULL",
-                            (refund_addr, row["task_id"], hit["tx_hash"]))
-                        db.commit()
-                        if cur_rf.rowcount == 0:
-                            self._send(200, _rpc_result(rid, _working(row["task_id"], "订单状态已变化,请重试。")))
-                            return
-                    # 无退款地址则保持 paid_undelivered(已是该状态,无需再写)
+                    # 不在此路径收集 refundAddress(会绕过正规退款通道的地址校验, 造成既交付又退款)
+                    # 保持 paid_undelivered, 用户下次重试会补发; 退款走独立 refundAddress 通道
                     notice = (f"付款已确认（tx {hit['tx_hash'][:12]}…），但内容源暂不可用：{e}。"
-                              f"系统将补发；如需退款请回传 refundAddress。")
-                    if refund_addr:
-                        notice += f" 已收到退款地址 {refund_addr[:8]}…，退款待人工处理。"
+                              f"系统将补发；如需退款请回传 refundAddress（独立退款流程，人工处理）。")
                     self._send(200, _rpc_result(rid, _working(row["task_id"], notice)))
                     return
                 # 固化交付物: 订阅订单不固化快照(每次现取最新), 单次订单固化 artifact
@@ -777,63 +842,15 @@ class Handler(BaseHTTPRequestHandler):
                     if st == "refunded":
                         self._send(200, _rpc_error(rid, -32007, "order refunded"))
                         return
+                    # task_id 是公开标识(会进 trace/日志/relay), 只披露订单状态, 不交付内容。
+                    # 取货唯一凭证 = payment_id(144bit 高熵 secret); tx_hash 是公开链上数据, 不作身份证明。
+                    # 丢失 payment_id 走人工恢复(不提供 tx_hash 自助取货旁路)。
                     if st in ("paid", "paid_undelivered", "refund_requested"):
-                        # task_id 不是 secret(会进 A2A trace/日志/relay)。凭 task_id 取货必须附付款 tx_hash 证明。
-                        proof = meta.get("x402.payment.txHash") or (
-                            (meta.get("x402.payment.payload") or {}).get("txHash")
-                            if isinstance(meta.get("x402.payment.payload"), dict) else None)
-                        if not isinstance(proof, str) or not existing["tx_hash"] or \
-                                proof.strip().lower() != existing["tx_hash"].lower():
-                            self._send(200, _rpc_error(rid, -32009,
-                                "resubmit with your paymentId, or provide x402.payment.txHash as proof of payment"))
-                            return
-                        if (existing["delivered_count"] or 0) >= MAX_DELIVER:
-                            self._send(200, _rpc_error(rid, -32010,
-                                "delivery limit reached; contact support"))
-                            return
-                        # 已付款: 凭 tx_hash 证明取货(不回传 payment_id)
-                        if existing["artifact"]:
-                            db.execute("UPDATE orders SET delivered_count=delivered_count+1 WHERE task_id=?",
-                                       (client_task_id,))
-                            db.commit()
-                            self._send(200, _rpc_result(rid, _completed(
-                                client_task_id, existing["artifact"],
-                                {"success": True, "transaction": existing["tx_hash"],
-                                 "network": "tron-mainnet"})))
-                            return
-                        # 已付未交付: 走补发逻辑
-                        try:
-                            brief = gen_intel_brief()
-                        except BriefUnavailable as e:
-                            self._send(200, _rpc_result(rid, _working(client_task_id, str(e))))
-                            return
-                        cur = db.execute(
-                            "UPDATE orders SET status='paid', artifact=?, refund_address=NULL, "
-                            "paid_at=COALESCE(paid_at, ?), delivered_count=delivered_count+1 "
-                            "WHERE task_id=? AND status IN ('paid','paid_undelivered','refund_requested') "
-                            "AND artifact IS NULL AND refund_requested_at IS NULL",
-                            (brief, _now_str(), client_task_id))
-                        if cur.rowcount == 0:
-                            db.rollback()
-                            won = db.execute("SELECT artifact, tx_hash FROM orders WHERE task_id=?",
-                                             (client_task_id,)).fetchone()
-                            if won and won["artifact"]:
-                                self._send(200, _rpc_result(rid, _completed(
-                                    client_task_id, won["artifact"],
-                                    {"success": True, "transaction": won["tx_hash"],
-                                     "network": "tron-mainnet"})))
-                                return
-                            self._send(200, _rpc_error(rid, -32006, "order state changed, retry"))
-                            return
-                        db.commit()
-                        self._send(200, _rpc_result(rid, _completed(
-                            client_task_id, brief,
-                            {"success": True, "transaction": existing["tx_hash"],
-                             "network": "tron-mainnet"})))
-                        return
-                    # pending/expired: 未付款,不披露 payment_id
-                    self._send(200, _rpc_error(rid, -32008,
-                        "order exists and awaiting payment; resubmit with your paymentId"))
+                        hint = "内容已就绪，请回传 paymentId 获取；丢失 paymentId 请联系支持人工恢复。"
+                    else:
+                        hint = "订单待付款，请付款后回传 paymentId 获取内容。"
+                    self._send(200, _rpc_result(rid, _working(client_task_id,
+                        f"订单状态: {st}。{hint}")))
                     return
 
             # 开单配额(DB 为准): 每 IP pending 上限 + 内存开单限流(辅助)
@@ -887,9 +904,7 @@ class Handler(BaseHTTPRequestHandler):
                 if sku not in PRICE_CENTS:
                     sku = DEFAULT_SKU
                 amount_cents = PRICE_CENTS[sku]
-                access_until_ms = 0
-                if SKU_DAYS[sku] > 0:
-                    access_until_ms = now_ms + SKU_DAYS[sku] * 24 * 3600 * 1000
+                access_until_ms = 0  # 订阅有效期在付款确认时起算(见认领 SQL), 开单时仅占位
                 db.execute(
                     "INSERT INTO orders (task_id, payment_id, receive_address, address_index, amount_cents, status, "
                     "created_at_ms, expires_at_ms, creator_ip, sku, access_until_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -928,11 +943,15 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._sem.acquire(blocking=False):
+            # 并发已满: 直接关闭连接。不能走 shutdown_request(它的 finally 会 release, 造成许可记账错误)
             try:
                 request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
             except Exception:
                 pass
-            self.shutdown_request(request)
+            try:
+                request.close()
+            except Exception:
+                pass
             return
         super().process_request(request, client_address)
 
@@ -940,10 +959,8 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         try:
             super().shutdown_request(request)
         finally:
-            try:
-                self._sem.release()
-            except ValueError:
-                pass
+            # 只有真正取得许可的工作线程走到这里才 release(acquire 失败路径不经过 shutdown_request)
+            self._sem.release()
 
 
 def main():

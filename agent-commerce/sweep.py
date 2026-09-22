@@ -157,6 +157,30 @@ def wait_for_result(client: Tron, txid: str, timeout: int = 90):
     return False, None  # 超时未确认, 视为失败(保守, 不标 swept)
 
 
+def tx_exists(client: Tron, txid: str):
+    """返回 True=链上存在, False=链上不存在, None=查询失败(不确定)。用于区分"从未上链"与"上链失败"。"""
+    try:
+        info = client.get_transaction_info(txid)
+        return info is not None
+    except Exception:
+        return None
+
+
+def _age_seconds(ts_str):
+    """把 _now_str() 的 ISO 时间戳解析成距今秒数; 解析失败返回 0(不触发自动恢复, 保守)。"""
+    if not ts_str:
+        return 0
+    try:
+        from datetime import datetime, timezone
+        ts = ts_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, time.time() - dt.timestamp())
+    except Exception:
+        return 0.0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--execute", action="store_true", help="真实广播(默认 dry-run)")
@@ -203,9 +227,18 @@ def main() -> None:
                                (_now_str(), order["task_id"]))
                     db.commit()
                     log(f"RECONFIRM SWEPT {tid}… tx={order['sweep_tx'][:12]}… 上次已上链, 补记 swept")
+                    continue
+                # 自动恢复: 广播后未上链(网络抖动/交易过期) → 链上查无此 tx 且超 5min, 清 sweep_tx 重走归集
+                exists = tx_exists(client, order["sweep_tx"])
+                if exists is False and _age_seconds(order["sweep_at"]) > 300:
+                    db.execute("UPDATE orders SET sweep_tx=NULL, sweep_at=NULL WHERE task_id=?",
+                               (order["task_id"],))
+                    db.commit()
+                    log(f"RECOVER {tid}… 上次归集 tx={order['sweep_tx'][:12]}… 链上查无此交易, 清 sweep_tx 重新归集")
+                    # 不 continue, 继续走下面正常归集流程
                 else:
-                    log(f"HOLD {tid}… 上次归集 tx={order['sweep_tx'][:12]}… 状态未知, 人工核查")
-                continue
+                    log(f"HOLD {tid}… 上次归集 tx={order['sweep_tx'][:12]}… 状态未知(存在={exists}), 人工核查")
+                    continue
             # 1. 查 USDT 实际余额(不是订单金额, 多付/重复付款都归集)
             bal = get_usdt_balance(client, from_addr)
             if bal is None:
@@ -276,7 +309,8 @@ def main() -> None:
             try:
                 usdt_txn = build_transfer(client, from_addr, priv, RECEIVE_ADDRESS, bal)
                 txid = usdt_txn.txid  # 离线计算 txid, 广播前先落盘(防广播后崩溃, 下轮 RECONFIRM 不重复归集)
-                db.execute("UPDATE orders SET sweep_tx=? WHERE task_id=?", (txid, order["task_id"]))
+                db.execute("UPDATE orders SET sweep_tx=?, sweep_at=? WHERE task_id=?",
+                           (txid, _now_str(), order["task_id"]))
                 db.commit()
                 result = usdt_txn.broadcast()
             except Exception as e:
