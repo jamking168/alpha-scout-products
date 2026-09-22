@@ -41,6 +41,8 @@ def log(msg: str) -> None:
 def main() -> None:
     db = sqlite3.connect(DB_PATH, timeout=10)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=8000")
     now_ms = _now_ms()
     orders = db.execute(
         "SELECT * FROM orders WHERE status IN ('pending','expired') "
@@ -91,14 +93,18 @@ def main() -> None:
             wrong = (txid, raw, tx.get("from", ""))
 
         if found:
-            cur = db.execute(
-                "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=? "
-                "WHERE task_id=? AND status IN ('pending','expired') AND tx_hash IS NULL",
-                (_now_str(), found, order["task_id"]),
-            )
-            db.commit()
-            if cur.rowcount == 1:
-                log(f"AUTO-CLAIM: {tid}… tx {found[:12]}… -> paid_undelivered")
+            try:
+                cur = db.execute(
+                    "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=? "
+                    "WHERE task_id=? AND status IN ('pending','expired') AND tx_hash IS NULL",
+                    (_now_str(), found, order["task_id"]),
+                )
+                db.commit()
+                if cur.rowcount == 1:
+                    log(f"AUTO-CLAIM: {tid}… tx {found[:12]}… -> paid_undelivered")
+            except sqlite3.IntegrityError:
+                db.rollback()
+                log(f"ALERT: {tid}… tx {found[:12]}… 已被其他订单认领, 人工核查!")
         elif wrong:
             log(
                 f"AMOUNT-MISMATCH: {tid}… addr={addr} tx {wrong[0][:12]}… "

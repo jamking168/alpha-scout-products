@@ -6,17 +6,19 @@
 
 安全边界(真金白银红线):
   - 默认 --dry-run: 只扫描 + 构建交易 + 签名, 不广播。
-  - 真实归集需显式 --execute(广播到主网), 由用户逐单确认后执行。
-  - 子地址转出 USDT 需要能量/带宽(TRC20 转账约 31,895 能量 ≈ 13.3 TRX),
-    子地址须先有少量 TRX 供烧, 否则归集失败(insufficient balance)。
+  - 真实归集需显式 --execute(广播到主网)。
+  - 归集后必须验证链上回执(receipt.result == SUCCESS)才标记 swept, 否则资金滞留。
+  - 每笔归集烧约 13.3 TRX, 低于 MIN_SWEEP_RAW 阈值的不归集(等积累, 摊薄成本)。
 
 用法:
-  python3 sweep.py              # dry-run: 扫描 + 构建签名, 不广播(默认)
-  python3 sweep.py --execute    # 真实广播归集(须用户确认)
+  python3 sweep.py                    # dry-run(默认)
+  python3 sweep.py --execute          # 真实广播归集
+  python3 sweep.py --execute --min-sweep 50000000   # 自定义归集阈值(raw, 默认 $50)
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import sqlite3
 import sys
@@ -38,8 +40,11 @@ from a2a_server import (  # noqa: E402
 )
 
 LOG_PATH = os.path.join(STATE_DIR, "sweep.log")
-FEE_LIMIT_SUN = 30_000_000  # 30 TRX 烧 TRX 上限(能量不足时兜底)
-TRX_FUND_SUN = 15_000_000   # 归集前给子地址充值的 TRX(激活 + 烧能量, TRC20 转账约 13.3 TRX)
+LOCK_PATH = os.path.join(STATE_DIR, "sweep.lock")
+FEE_LIMIT_SUN = 30_000_000       # 30 TRX 烧 TRX 上限(能量不足时兜底)
+TRX_FUND_SUN = 15_000_000        # 充值目标(激活 + 烧能量, TRC20 转账约 13.3 TRX)
+TRX_FUND_MIN_DEFICIT = 1_000_000  # 差额 < 1 TRX 不补(避免碎片充值)
+MIN_SWEEP_RAW = 50_000_000        # 归集阈值 $50: 低于此不归集, 等积累摊薄 13 TRX 成本
 
 
 def log(msg: str) -> None:
@@ -50,6 +55,18 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
+def acquire_lock():
+    """flock 非阻塞锁: 防止两个归集实例并发重复广播。"""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fh = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("另一个 sweep 实例正在运行, 退出")
+        sys.exit(0)
+    return fh
+
+
 def ensure_schema(db) -> None:
     cols = {r[1] for r in db.execute("PRAGMA table_info(orders)")}
     if "swept" not in cols:
@@ -58,14 +75,35 @@ def ensure_schema(db) -> None:
         db.execute("ALTER TABLE orders ADD COLUMN sweep_tx TEXT")
     if "sweep_at" not in cols:
         db.execute("ALTER TABLE orders ADD COLUMN sweep_at TEXT")
+    if "fund_tx" not in cols:
+        db.execute("ALTER TABLE orders ADD COLUMN fund_tx TEXT")
     db.commit()
 
 
 def pending_orders(db):
+    """扫所有收到钱但未归集的订单(含 paid_undelivered / refund_requested, 这些地址上也有真金白银)。"""
     return db.execute(
-        "SELECT * FROM orders WHERE status='paid' AND artifact IS NOT NULL "
-        "AND COALESCE(swept, 0) = 0"
+        "SELECT * FROM orders WHERE tx_hash IS NOT NULL AND COALESCE(swept, 0) = 0 "
+        "AND receive_address IS NOT NULL"
     ).fetchall()
+
+
+def get_trx_balance(client: Tron, addr: str):
+    """查 TRX 余额(sun)。返回 None 表示查询失败(不能当成余额 0)。"""
+    try:
+        acc = client.get_account(addr)
+        return int(acc.get("balance", 0))
+    except Exception:
+        return None
+
+
+def get_usdt_balance(client: Tron, addr: str):
+    """查 USDT 余额(raw)。返回 None 表示查询失败。"""
+    try:
+        contract = client.get_contract(USDT_CONTRACT)
+        return int(contract.functions.balanceOf(addr))
+    except Exception:
+        return None
 
 
 def build_transfer(client: Tron, from_addr: str, priv: bytes, to_addr: str, amount_raw: int):
@@ -76,25 +114,14 @@ def build_transfer(client: Tron, from_addr: str, priv: bytes, to_addr: str, amou
         .fee_limit(FEE_LIMIT_SUN)
     )
     # 离线构建 + 签名: 绕过 getsignweight 网络调用(公共 TronGrid 严格 429 限流)。
-    # 子地址是普通账户(owner 单私钥), 无需链上权限查询即可离线签名。
     ref_block_id = client.get_latest_solid_block_id()
     built = txn.build(offline=True, ref_block_id=ref_block_id)
     signed = built.sign(PrivateKey(priv))
-    signed._client = client  # 广播时挂回 client
+    signed._client = client
     return signed
 
 
-def get_trx_balance(client: Tron, addr: str) -> int:
-    """查地址 TRX 余额(sun)。未激活/不存在地址返回 0。"""
-    try:
-        acc = client.get_account(addr)
-        return int(acc.get("balance", 0))
-    except Exception:
-        return 0
-
-
 def build_trx_transfer(client: Tron, from_addr: str, priv: bytes, to_addr: str, amount_sun: int):
-    """构建 TRX 转账(离线签名)。"""
     txn = client.trx.transfer(from_addr, to_addr, amount_sun).fee_limit(1_000_000)
     ref_block_id = client.get_latest_solid_block_id()
     built = txn.build(offline=True, ref_block_id=ref_block_id)
@@ -103,16 +130,37 @@ def build_trx_transfer(client: Tron, from_addr: str, priv: bytes, to_addr: str, 
     return signed
 
 
+def wait_for_result(client: Tron, txid: str, timeout: int = 90):
+    """轮询链上回执, 返回 (success: bool, receipt: dict|None)。广播成功 ≠ 执行成功。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            info = client.get_transaction_info(txid)
+            if info and info.get("receipt"):
+                receipt = info["receipt"]
+                return receipt.get("result") == "SUCCESS", receipt
+        except Exception:
+            pass
+        time.sleep(3)
+    return False, None  # 超时未确认, 视为失败(保守, 不标 swept)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--execute", action="store_true", help="真实广播(默认 dry-run)")
+    ap.add_argument("--min-sweep", type=int, default=MIN_SWEEP_RAW,
+                    help=f"归集阈值(raw, 默认 {MIN_SWEEP_RAW} = $50)")
     args = ap.parse_args()
 
+    lock = acquire_lock()
     try:
         mnemonic = hd_wallet.load_mnemonic()
     except RuntimeError as e:
         log(f"ERROR: {e}")
         return
+
+    # 启动自检: index0 == RECEIVE_ADDRESS, 错了就往黑洞打 TRX
+    hd_wallet.verify_wallet(RECEIVE_ADDRESS)
 
     client = Tron(HTTPProvider(endpoint_uri="https://api.trongrid.io"))
     with db_conn() as db:
@@ -121,55 +169,83 @@ def main() -> None:
         if not orders:
             log("无待归集订单")
             return
-        log(f"待归集订单 {len(orders)} 笔")
+        log(f"待归集订单 {len(orders)} 笔, 归集阈值 ${args.min_sweep / 1e6:.0f}")
         for order in orders:
             idx = order["address_index"]
             from_addr = order["receive_address"]
-            amount_raw = order["amount_cents"] * 10000
             tid = order["task_id"][:12]
+            if idx is None or from_addr is None:
+                log(f"SKIP {tid}… 缺 address_index/receive_address")
+                continue
             try:
                 priv = hd_wallet.derive_private_key(mnemonic, idx)
-                main_priv = hd_wallet.derive_private_key(mnemonic, 0)  # 主地址(index 0)私钥
+                main_priv = hd_wallet.derive_private_key(mnemonic, 0)
             except Exception as e:
                 log(f"BUILD FAIL {tid}… {e}")
                 continue
-            # 1. TRX 充值: 子地址 TRX 不足时从主地址转(激活 + 烧能量)
-            need_fund = False
-            try:
-                trx = get_trx_balance(client, from_addr)
-                need_fund = trx < TRX_FUND_SUN
-                fund_txn = (
-                    build_trx_transfer(client, RECEIVE_ADDRESS, main_priv, from_addr, TRX_FUND_SUN)
-                    if need_fund else None
+            # 1. 查 USDT 实际余额(不是订单金额, 多付/重复付款都归集)
+            bal = get_usdt_balance(client, from_addr)
+            if bal is None:
+                log(f"SKIP {tid}… USDT 余额查询失败(429/超时), 保留待重试")
+                continue
+            if bal <= 0:
+                log(f"SKIP {tid}… 余额 0, 标记 swept")
+                db.execute(
+                    "UPDATE orders SET swept=1, sweep_tx='NO_BALANCE', sweep_at=? WHERE task_id=?",
+                    (_now_str(), order["task_id"]),
                 )
-            except Exception as e:
-                log(f"TRX 检查失败 {tid}…: {e}")
+                db.commit()
                 continue
-            # 2. USDT 归集
-            try:
-                usdt_txn = build_transfer(client, from_addr, priv, RECEIVE_ADDRESS, amount_raw)
-            except Exception as e:
-                log(f"BUILD FAIL {tid}… addr={from_addr}: {e}")
+            if bal < args.min_sweep:
+                log(f"SKIP {tid}… 余额 {bal / 1e6:.2f} USDT < 阈值 ${args.min_sweep / 1e6:.0f}, 等积累")
                 continue
+            # 2. TRX 差额充值(幂等: 已有 fund_tx 则跳过)
+            trx = get_trx_balance(client, from_addr)
+            if trx is None:
+                log(f"SKIP {tid}… TRX 余额查询失败, 保留待重试")
+                continue
+            deficit = TRX_FUND_SUN - trx
+            need_fund = deficit > TRX_FUND_MIN_DEFICIT and (order["fund_tx"] is None)
+            # 3. dry-run
             if not args.execute:
-                fund_note = f" + 先充值 {TRX_FUND_SUN/1e6:.0f} TRX" if need_fund else ""
-                log(f"DRY-RUN {tid}… from={from_addr} -> {RECEIVE_ADDRESS} USDT_raw={amount_raw}{fund_note}")
+                fund_note = f" + 充值 {deficit / 1e6:.1f} TRX" if need_fund else ""
+                log(f"DRY-RUN {tid}… from={from_addr} -> {RECEIVE_ADDRESS} USDT={bal / 1e6:.2f}{fund_note}")
                 continue
-            try:
-                if need_fund:
+            # 4. 充值(差额, 广播后先记 fund_tx 再验回执, 防崩溃重跑重复充值)
+            if need_fund:
+                try:
+                    fund_txn = build_trx_transfer(client, RECEIVE_ADDRESS, main_priv, from_addr, deficit)
                     fr = fund_txn.broadcast()
-                    log(f"TRX-FUND {tid}… tx={fr.get('txid')}")
-                    time.sleep(5)  # 等 TRX 到账(TRON 3s 出块)
+                    ftx = fr.get("txid")
+                    db.execute("UPDATE orders SET fund_tx=? WHERE task_id=?", (ftx, order["task_id"]))
+                    db.commit()
+                    log(f"TRX-FUND {tid}… tx={ftx} amount={deficit / 1e6:.2f}")
+                    ok, _ = wait_for_result(client, ftx)
+                    if not ok:
+                        log(f"TRX-FUND 未确认 {tid}… 保留待重试(已有 fund_tx, 不会重复充)")
+                        continue
+                except Exception as e:
+                    log(f"TRX-FUND FAIL {tid}…: {e}")
+                    continue
+            # 5. 归集 USDT(全部实际余额)
+            try:
+                usdt_txn = build_transfer(client, from_addr, priv, RECEIVE_ADDRESS, bal)
                 result = usdt_txn.broadcast()
                 txid = result.get("txid")
+            except Exception as e:
+                log(f"SWEEP FAIL {tid}…: {e}")
+                continue
+            # 6. 验回执: 只有链上 SUCCESS 才标 swept(广播成功 ≠ 执行成功)
+            ok, receipt = wait_for_result(client, txid)
+            if ok:
                 db.execute(
                     "UPDATE orders SET swept=1, sweep_tx=?, sweep_at=? WHERE task_id=?",
                     (txid, _now_str(), order["task_id"]),
                 )
                 db.commit()
-                log(f"SWEPT {tid}… tx={txid}")
-            except Exception as e:
-                log(f"SWEEP FAIL {tid}…: {e}")
+                log(f"SWEPT {tid}… tx={txid} amount={bal / 1e6:.2f}")
+            else:
+                log(f"SWEEP REVERT {tid}… tx={txid} receipt={receipt}, 保留待人工核查")
 
 
 if __name__ == "__main__":

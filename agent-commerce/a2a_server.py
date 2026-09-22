@@ -30,7 +30,7 @@ import time
 import urllib.request
 from contextlib import contextmanager
 
-from hd_wallet import derive_address, load_mnemonic
+from hd_wallet import derive_address, load_mnemonic, verify_wallet
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -81,10 +81,13 @@ CREATE TABLE IF NOT EXISTS orders (
     creator_ip     TEXT,
     swept          INTEGER DEFAULT 0,   -- 归集状态(0 未归集, 1 已归集)
     sweep_tx       TEXT,                 -- 归集交易 txid
-    sweep_at       TEXT
+    sweep_at       TEXT,
+    fund_tx        TEXT                  -- TRX 充值交易 txid(幂等标记, 防重复充值)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ix_addr_active
-    ON orders(receive_address) WHERE status='pending';
+CREATE TABLE IF NOT EXISTS hd_counter (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    next_index INTEGER NOT NULL
+);
 """
 
 
@@ -124,6 +127,16 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN sweep_tx TEXT")
         if "sweep_at" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN sweep_at TEXT")
+        if "fund_tx" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN fund_tx TEXT")
+        # 迁移完成后再建索引(先补列再建索引, 避免旧库无列时报错)
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_addr_unique ON orders(receive_address)")
+        # 旧架构迁移: 无独立地址的旧 pending 订单作废(旧共享地址+尾数架构已废弃)
+        c.execute("UPDATE orders SET status='expired' WHERE receive_address IS NULL AND status='pending'")
+        # hd_counter 初始化 + 对齐到 MAX(address_index)+1(单调递增, 删行/清理不回退)
+        c.execute("INSERT OR IGNORE INTO hd_counter (id, next_index) VALUES (1, 1)")
+        mx = c.execute("SELECT COALESCE(MAX(address_index), 0) FROM orders").fetchone()[0]
+        c.execute("UPDATE hd_counter SET next_index = MAX(next_index, ?) WHERE id = 1", (mx + 1,))
         c.commit()
 
 
@@ -679,9 +692,16 @@ class Handler(BaseHTTPRequestHandler):
                     db.rollback()
                     self._send(503, _rpc_error(rid, -32004, "payment unavailable, retry later"))
                     return
-                # 派生下一个独立收款地址(HD 序号单调递增, 每个地址只服务一个订单)。
+                # 派生下一个独立收款地址: 从单调计数器取(独立于 orders 行, 删行/清理/回滚不会回退导致地址复用)。
                 # index 0 = 归集主地址(RECEIVE_ADDRESS), 子地址从 index 1 开始, 避免撞主地址。
-                next_idx = db.execute("SELECT COALESCE(MAX(address_index), 0) + 1 FROM orders").fetchone()[0]
+                row = db.execute("SELECT next_index FROM hd_counter WHERE id = 1").fetchone()
+                next_idx = row[0]
+                if db.execute("SELECT 1 FROM orders WHERE address_index = ?", (next_idx,)).fetchone():
+                    db.rollback()
+                    log.error("HD index %s 已被占用, 计数器不一致, 拒绝开单", next_idx)
+                    self._send(503, _rpc_error(rid, -32004, "payment unavailable, retry later"))
+                    return
+                db.execute("UPDATE hd_counter SET next_index = ? WHERE id = 1", (next_idx + 1,))
                 receive_addr = derive_address(mnemonic, next_idx)
                 task_id = f"task-{secrets.token_urlsafe(24)}"
                 payment_id = f"pay-{secrets.token_urlsafe(24)}"
@@ -694,7 +714,8 @@ class Handler(BaseHTTPRequestHandler):
                 db.commit()
             except sqlite3.IntegrityError:
                 db.rollback()
-                self._send(503, _rpc_error(rid, -32004, "payment slots exhausted, retry later"))
+                log.error("开单 IntegrityError: 地址撞车或唯一约束冲突, 需人工核查")
+                self._send(503, _rpc_error(rid, -32004, "payment unavailable, retry later"))
                 return
             except sqlite3.OperationalError:
                 db.rollback()
@@ -705,6 +726,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
+    verify_wallet(RECEIVE_ADDRESS)  # index0 自检: 助记词错误拒绝启动, 防止收款到不可控地址
     srv = ThreadingHTTPServer(LISTEN, Handler)
     log.info("A2A 服务启动 http://%s:%s", LISTEN[0], LISTEN[1])
     srv.serve_forever()
