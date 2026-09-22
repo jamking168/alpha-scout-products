@@ -87,7 +87,6 @@ LATE_PAY_GRACE = 6 * 3600    # 迟到付款宽限 6 小时(交易所 TRC20 提�
 MAX_BODY = 64 * 1024        # 请求体上限 64 KiB
 MAX_DELIVER = 5             # 单订单交付次数硬上限(含网络重试余量; 防 task_id 泄露无限白嫖)
 SUB_DAY_LIMIT = 3           # 订阅每日交付上限(简报日更, 正常 1 次/天; 防 payment_id 泄露无限白嫖)
-SUB_ANNUAL_TOTAL_LIMIT = 365 * 3  # 年订总量封顶(365 天 × 每日 3 次)
 RATE_LIMIT = 5              # 每 IP 每窗口请求数
 RATE_WINDOW = 60            # 限流窗口秒
 NEW_ORDER_LIMIT = 3         # 每 IP 每窗口「创建订单」配额(与通用 RPC 限流解耦)
@@ -235,14 +234,28 @@ def gen_intel_brief() -> str:
     try:
         with db_conn(path=INTEL_DB, readonly=True) as c:
             rows = c.execute(
-                "SELECT date, memo_title, category, evidence_grade, body "
+                "SELECT date, memo_title, category, evidence_grade, body, created_at "
                 "FROM intel_memo WHERE verdict='GO' ORDER BY created_at DESC LIMIT 6"
             ).fetchall()
     except Exception as e:
         raise BriefUnavailable(f"情报库读取失败: {e}") from e
     if not rows:
         raise BriefUnavailable("当前无可交付的 GO 级信号")
-    lines = ["## 千里眼 · 每日情报简报", "", "### 当前 GO 级信号（可落地方向）", ""]
+    header = "### 当前 GO 级信号（可落地方向）"
+    # 新鲜度标注: 24h 内无新增则诚实说明, 不把旧内容冒充新信号(履约底线)
+    newest = rows[0]['created_at'] or ''
+    try:
+        newest_dt = datetime.datetime.fromisoformat(str(newest).replace("Z", "+00:00"))
+        if newest_dt.tzinfo is None:
+            newest_dt = newest_dt.replace(tzinfo=datetime.timezone.utc)
+        age_s = (datetime.datetime.now(datetime.timezone.utc) - newest_dt).total_seconds()
+        if age_s > 24 * 3600:
+            header += ("\n\n> ⚠️ 过去 24 小时无新增 GO 级信号，以下为最近 6 条（最新入库 "
+                       f"{newest_dt.strftime('%Y-%m-%d %H:%M')} UTC）。\n"
+                       "> 无料时我们不编内容——按证据筛选，不保证每日必有新条目。")
+    except Exception:
+        pass
+    lines = ["## 千里眼 · 每日情报简报", "", header, ""]
     for i, r in enumerate(rows, 1):
         title = (r['memo_title'] or '').strip()
         grade = r['evidence_grade'] or '未分级'
@@ -259,13 +272,20 @@ def gen_intel_brief() -> str:
 
 
 def gen_sample_brief() -> str:
-    """免费 Sample: 最新 1 条 GO 信号的完整版(证据链 + 赚钱路径), 展示真实质量。不是删减版标题。"""
+    """免费 Sample: 取较早的历史 GO 信号完整版(质量证明, 不泄露最新时效价值)。
+
+    最新 = 最值钱, 保留在付费侧。Sample 展示的是"判断质量"(证据链+落地路径), 不是实时性。"""
     try:
         with db_conn(path=INTEL_DB, readonly=True) as c:
             row = c.execute(
-                "SELECT date, memo_title, category, evidence_grade, body "
-                "FROM intel_memo WHERE verdict='GO' ORDER BY created_at DESC LIMIT 1"
+                "SELECT date, memo_title, category, evidence_grade, body, created_at "
+                "FROM intel_memo WHERE verdict='GO' ORDER BY created_at DESC LIMIT 1 OFFSET 7"
             ).fetchone()
+            if not row:  # 少于 8 条则回退最新(保证 sample 可用)
+                row = c.execute(
+                    "SELECT date, memo_title, category, evidence_grade, body, created_at "
+                    "FROM intel_memo WHERE verdict='GO' ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
     except Exception as e:
         raise BriefUnavailable(f"情报库读取失败: {e}") from e
     if not row:
@@ -274,11 +294,11 @@ def gen_sample_brief() -> str:
     grade = row['evidence_grade'] or '未分级'
     cat = row['category'] or 'N/A'
     body = (row['body'] or '').strip()
-    lines = ["## 千里眼 · 免费样报（最新 1 条 GO 信号 · 完整版）", "",
+    lines = ["## 千里眼 · 免费样报（历史 GO 信号 · 完整版）", "",
              f"### {title}", f"*{cat} · 证据级 {grade} · {row['date']}*", "", body, "",
              "---",
-             "这是免费样报（1 条完整信号，含证据链与落地路径）。",
-             "订阅可获取每日最新 6 条 GO 信号 + 持续跟踪 + 历史。",
+             "这是免费样报（历史信号完整版，含证据链与落地路径）。",
+             "订阅可获取每日最新 GO 信号 + 持续跟踪 + 历史。",
              "本简报由千里眼 agent 集群自动生成，不构成投资建议。"]
     return "\n".join(lines)
 
@@ -629,17 +649,19 @@ class Handler(BaseHTTPRequestHandler):
                     if row["status"] == "refunded":
                         self._send(200, _rpc_error(rid, -32007, "order refunded"))
                         return
-                    # 已交付则拒绝自助退款(防"既拿货又退款"): 走人工争议流程
-                    if (row["delivered_count"] or 0) > 0 or row["artifact"]:
-                        self._send(200, _rpc_result(rid, _working(
-                            row["task_id"],
-                            "订单已交付内容，自助退款通道不适用；如有争议请联系支持人工处理。")))
-                        return
-                    db.execute(
+                    # 条件 UPDATE 原子登记退款: 已交付/退款中的订单拒绝自助退款(防"既拿货又退款"的 TOCTOU 竞态)
+                    cur = db.execute(
                         "UPDATE orders SET refund_address=?, refund_requested_at=? "
-                        "WHERE task_id=? AND status != 'refunded'",
+                        "WHERE task_id=? AND status != 'refunded' "
+                        "AND COALESCE(delivered_count,0)=0 AND (artifact IS NULL OR artifact='')",
                         (refund_addr, _now_str(), row["task_id"]),
                     )
+                    if cur.rowcount == 0:
+                        db.rollback()
+                        self._send(200, _rpc_result(rid, _working(
+                            row["task_id"],
+                            "订单已交付内容或状态已变化，自助退款通道不适用；如有争议请联系支持人工处理。")))
+                        return
                     db.commit()
                     self._send(200, _rpc_result(rid, _working(
                         row["task_id"],
@@ -708,7 +730,35 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 if row["status"] in ("paid", "paid_undelivered", "refund_requested"):
-                    # 已付款但未交付: 尝试补发(退款申请中也可补发,人工退款前先交付)
+                    # 订阅订单补发: 激活 status=paid, 现取最新 + 扣日额度(不固化快照, 与正常复取一致)
+                    if _is_sub(row["sku"]):
+                        if _now_ms() > (row["access_until_ms"] or 0):
+                            self._send(200, _rpc_error(rid, -32011, "subscription expired, please renew"))
+                            return
+                        try:
+                            brief = gen_intel_brief()
+                        except BriefUnavailable as e:
+                            self._send(200, _rpc_result(rid, _working(row["task_id"], str(e))))
+                            return
+                        today = _now_str()[:10]
+                        cur = db.execute(
+                            "UPDATE orders SET status='paid', "
+                            "day_deliver_count = CASE WHEN COALESCE(last_deliver_day,'') = ? THEN day_deliver_count + 1 ELSE 1 END, "
+                            "last_deliver_day = ?, delivered_count = delivered_count + 1 "
+                            "WHERE task_id = ? AND status IN ('paid','paid_undelivered','refund_requested') "
+                            "AND refund_requested_at IS NULL "
+                            "AND (COALESCE(last_deliver_day,'') <> ? OR day_deliver_count < ?)",
+                            (today, today, row["task_id"], today, SUB_DAY_LIMIT))
+                        if cur.rowcount == 0:
+                            db.rollback()
+                            self._send(200, _rpc_error(rid, -32006, "order state changed, retry"))
+                            return
+                        db.commit()
+                        self._send(200, _rpc_result(rid, _completed(
+                            row["task_id"], brief,
+                            {"success": True, "transaction": row["tx_hash"], "network": "tron-mainnet"})))
+                        return
+                    # 单次订单补发: 固化 artifact(退款申请中也可补发,人工退款前先交付)
                     try:
                         brief = gen_intel_brief()
                     except BriefUnavailable as e:
@@ -883,6 +933,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(429, _rpc_error(rid, -32005, "new order rate limited"))
                 return
 
+            # SKU 校验前移到事务外(禁售 SKU 不进入写事务, 避免 rollback 时 HWM 文件与 DB 计数器失配)
+            sku = meta.get("x402.product") or DEFAULT_SKU
+            if sku not in PRICE_CENTS:
+                sku = DEFAULT_SKU
+            if sku not in ENABLED_SKUS:
+                self._send(200, _rpc_error(rid, -32004, "unknown or unavailable SKU"))
+                return
+
             # 原子开单: BEGIN IMMEDIATE 内完成「回收过期 -> 计数 -> 派生独立地址 -> 插入」
             now_ms = _now_ms()
             try:
@@ -919,14 +977,7 @@ class Handler(BaseHTTPRequestHandler):
                 receive_addr = derive_address(mnemonic, next_idx)
                 task_id = f"task-{secrets.token_urlsafe(24)}"
                 payment_id = f"pay-{secrets.token_urlsafe(24)}"
-                # 识别 SKU(从 metadata 的 x402.product, 默认 single); 分层结构固定, 数字从 PRICE_CENTS 取
-                sku = meta.get("x402.product") or DEFAULT_SKU
-                if sku not in PRICE_CENTS:
-                    sku = DEFAULT_SKU
-                if sku not in ENABLED_SKUS:
-                    db.rollback()  # 禁售 SKU(年订) 明确拒绝, 不偷偷回退卖货
-                    self._send(200, _rpc_error(rid, -32004, f"SKU '{sku}' 暂未开放，请联系支持"))
-                    return
+                # SKU 已在事务外校验并拒绝禁售项, 这里只取价
                 amount_cents = PRICE_CENTS[sku]
                 access_until_ms = 0  # 订阅有效期在付款确认时起算(见认领 SQL), 开单时仅占位
                 db.execute(

@@ -103,22 +103,26 @@ def pending_orders(db):
 def orphan_orders(db):
     """孤儿扫描: 未认领(tx_hash IS NULL)但地址可能有余额的订单(付款超 7h 窗/对账漏扫导致)。
 
-    这类订单的地址上可能躺着真金白银却既不给货也不归集, 必须每天查一次余额并告警。"""
-    cutoff_ms = _now_ms() - 30 * 24 * 3600 * 1000
+    排除 ORPHAN_RESOLVED(人工已结案), 而非排除所有 ORPHAN(否则标记一次即永久失明)。"""
+    cutoff_ms = _now_ms() - 365 * 24 * 3600 * 1000  # 放宽到 1 年(资金滞留不应因窗口消失)
     return db.execute(
         "SELECT * FROM orders WHERE receive_address IS NOT NULL AND tx_hash IS NULL "
         "AND status IN ('pending','expired') AND created_at_ms >= ? "
-        "AND (payment_exception IS NULL OR payment_exception NOT LIKE 'ORPHAN:%')",
+        "AND COALESCE(payment_exception,'') NOT LIKE 'ORPHAN_RESOLVED%'",
         (cutoff_ms,),
     ).fetchall()
 
 
 def get_trx_balance(client: Tron, addr: str):
-    """查 TRX 余额(sun)。返回 None 表示查询失败(不能当成余额 0)。"""
+    """查 TRX 余额(sun)。返回 None 表示查询失败(不能当成余额 0); 返回 0 表示未激活/确实无 TRX。"""
     try:
         acc = client.get_account(addr)
         return int(acc.get("balance", 0))
-    except Exception:
+    except Exception as e:
+        name = type(e).__name__
+        # 未激活账户(AddressNotFound): 视为余额 0(需激活, 由后续充值逻辑处理), 而非查询失败
+        if name == "AddressNotFound" or "not found" in str(e).lower() or "account" in str(e).lower():
+            return 0
         return None
 
 
@@ -171,11 +175,16 @@ def wait_for_result(client: Tron, txid: str, timeout: int = 90):
 
 
 def tx_exists(client: Tron, txid: str):
-    """返回 True=链上存在, False=链上不存在, None=查询失败(不确定)。用于区分"从未上链"与"上链失败"。"""
+    """返回 True=链上存在, False=链上明确不存在, None=查询失败(不确定)。
+
+    区分"明确未找到"(TransactionNotFound, 可安全重试) 与"网络/限流错误"(None, 保守 HOLD)。"""
     try:
         info = client.get_transaction_info(txid)
         return info is not None
-    except Exception:
+    except Exception as e:
+        name = type(e).__name__
+        if name == "TransactionNotFound" or "not found" in str(e).lower():
+            return False
         return None
 
 
@@ -220,10 +229,13 @@ def main() -> None:
             if not addr:
                 continue
             bal = get_usdt_balance(client, addr)
-            if bal and bal > 0:
+            if bal is None:
+                log(f"ORPHAN-RECHECK-FAIL {o['task_id'][:12]}… 余额查询失败(429/超时), 下轮重试")
+                continue
+            if bal > 0:
                 log(f"ORPHAN-ALERT: {o['task_id'][:12]}… addr={addr} 未认领但有 USDT 余额 {bal/1e6:.6f}, 人工决定补发/退款")
                 db.execute("UPDATE orders SET payment_exception=? WHERE task_id=?",
-                           ("ORPHAN: 有余额未认领", o["task_id"]))
+                           (f"ORPHAN: bal={bal} at={_now_str()}", o["task_id"]))
                 db.commit()
         orders = pending_orders(db)
         if not orders:
