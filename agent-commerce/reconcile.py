@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from a2a_server import (  # noqa: E402
     DB_PATH,
     PAYMENT_WINDOW,
+    LATE_PAY_GRACE,
     STATE_DIR,
     USDT_CONTRACT,
     _now_ms,
@@ -26,7 +27,7 @@ from a2a_server import (  # noqa: E402
     fetch_incoming_since,
 )
 
-LOOKBACK_MS = 2 * 3600 * 1000  # 2 小时
+LOOKBACK_MS = 24 * 3600 * 1000  # 回看 24 小时(原 2 小时覆盖不到交易所提币风控审核导致的迟到付款)
 LOG_PATH = os.path.join(STATE_DIR, "reconcile.log")
 
 
@@ -57,9 +58,10 @@ def main() -> None:
         addr = order["receive_address"]
         tid = order["task_id"][:12]
         target_raw = order["amount_cents"] * 10000
+        window_end = order["created_at_ms"] + (PAYMENT_WINDOW + LATE_PAY_GRACE) * 1000
         try:
             txs = fetch_incoming_since(
-                addr, order["created_at_ms"], order["created_at_ms"] + PAYMENT_WINDOW * 1000
+                addr, order["created_at_ms"], window_end
             )
         except Exception as e:
             log(f"ERROR: {tid}… TronGrid 查询失败: {e}")

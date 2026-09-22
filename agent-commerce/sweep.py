@@ -35,6 +35,7 @@ from a2a_server import (  # noqa: E402
     RECEIVE_ADDRESS,
     STATE_DIR,
     USDT_CONTRACT,
+    _now_ms,
     _now_str,
     db_conn,
 )
@@ -44,7 +45,8 @@ LOCK_PATH = os.path.join(STATE_DIR, "sweep.lock")
 FEE_LIMIT_SUN = 8_000_000        # 8 TRX 烧 TRX 上限(实际约 3.2 TRX + 波动余量, 原 30 TRX 过宽)
 TRX_FUND_SUN = 5_000_000         # 充值目标 5 TRX: 3.2 TRX 转账 + 1.8 TRX 余量(原 15 TRX 会沉没 11.8 TRX/单)
 TRX_FUND_MIN_DEFICIT = 500_000   # 差额 < 0.5 TRX 不补(避免碎片充值)
-MIN_SWEEP_RAW = 4_500_000        # 归集阈值 $4.5: 每地址只收一张 $5 订单, 单笔即归集(原 $50 会让归集从不发生)
+MIN_SWEEP_RAW = 1_500_000        # 归集阈值 $1.5: 覆盖 ~$1.1 链上成本 + 余量(每地址只收一单, 无"等积累")
+DUST_RAW = 1_000_000             # < $1 视为尘埃: 归集成本 > 币值, 标 DUST 终结不再复查(防 TronGrid 429 累积)
 TRX_DUST_SUN = 1_500_000         # 归集后子地址残余 TRX > 1.5 则回收(留 1.1 TRX 覆盖回收转账成本)
 MAIN_TRX_FLOOR_SUN = 50_000_000  # 主地址 TRX 低于 50 则停止充值(防主地址 TRX 漏光)
 
@@ -83,12 +85,18 @@ def ensure_schema(db) -> None:
 
 
 def pending_orders(db):
-    """扫所有收到钱但未归集的订单(含 paid_undelivered / refund_requested, 这些地址上也有真金白银)。
+    """扫收到钱但未归集的订单(含 paid_undelivered / refund_requested, 这些地址上也有真金白银)。
 
-    含 NO_BALANCE 复查: 余额 0 标记过的地址, 后续可能又收到钱(重复付款/延迟到账), 必须复查。"""
+    排除 DUST 终结态(归集成本 > 币值, 永久放弃)。
+    NO_BALANCE 地址做时间衰减复查: 创建 7 天内才复查(7 天后仍无钱基本不会再有了),
+    否则订单累积后每轮 sweep 的 TronGrid 调用线性增长, 必撞 429。"""
+    cutoff_ms = _now_ms() - 7 * 24 * 3600 * 1000
     return db.execute(
         "SELECT * FROM orders WHERE tx_hash IS NOT NULL AND receive_address IS NOT NULL "
-        "AND (COALESCE(swept, 0) = 0 OR sweep_tx = 'NO_BALANCE')"
+        "AND COALESCE(sweep_tx, '') != 'DUST' "
+        "AND (COALESCE(swept, 0) = 0 "
+        "     OR (sweep_tx = 'NO_BALANCE' AND created_at_ms >= ?))",
+        (cutoff_ms,),
     ).fetchall()
 
 
@@ -213,7 +221,19 @@ def main() -> None:
                 db.commit()
                 continue
             if bal < args.min_sweep:
-                log(f"SKIP {tid}… 余额 {bal / 1e6:.2f} USDT < 阈值 ${args.min_sweep / 1e6:.0f}, 等积累")
+                if bal < DUST_RAW:
+                    # 尘埃: 归集成本 > 币值, 永久放弃并终结复查(避免每轮打 TronGrid 累积 429)
+                    log(f"DUST {tid}… 余额 {bal / 1e6:.4f} USDT < ${DUST_RAW / 1e6:.2f}, "
+                        f"标记 DUST 不再复查(归集成本高于币值)")
+                    db.execute(
+                        "UPDATE orders SET swept=1, sweep_tx='DUST', sweep_at=? WHERE task_id=?",
+                        (_now_str(), order["task_id"]),
+                    )
+                    db.commit()
+                else:
+                    # $1.0–$1.5 灰区: 值得归集但需人工确认是否划算(少付/重复付款的残留)
+                    log(f"REVIEW {tid}… 余额 {bal / 1e6:.2f} USDT 在灰区 "
+                        f"[${DUST_RAW / 1e6:.2f}, ${args.min_sweep / 1e6:.2f}), 人工决定是否 --min-sweep 强制归集")
                 continue
             # 2. TRX 差额充值(幂等: 已有 fund_tx 则跳过)
             trx = get_trx_balance(client, from_addr)

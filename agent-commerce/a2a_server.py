@@ -46,11 +46,13 @@ RECEIVE_ADDRESS = "TLnnmqLiY4CE8bnekow6ikpjDHoytJP5p3"  # 归集主地址(子地
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 TRON_API = "https://api.trongrid.io/v1"
 INTEL_DB = "/home/jam/.hermes/profiles/alpha-scout/state/intel_library.db"
+TRON_ADDR_RE = __import__("re").compile(r'^T[1-9A-HJ-NP-Za-km-z]{33}$')  # TRON base58check 地址格式
 
 PRICE_CENTS = 500          # $5.00 = 500 分(独立地址下无尾数, 固定金额)
 # 独立地址架构: 每订单一个 HD 派生子地址(m/44'/195'/0'/0/N), 替代共享地址+尾数匹配。
 # master mnemonic 从环境变量 TRON_MASTER_MNEMONIC 读取(私钥级, 不落盘, 开单时懒加载)。
 PAYMENT_WINDOW = 3600        # 付款窗口 60 分钟(TRON 出块 3s,手动转账+交易所提币常超时,15 分钟太紧)
+LATE_PAY_GRACE = 6 * 3600    # 迟到付款宽限 6 小时(交易所 TRC20 提币经风控审核常超 1 小时, 过期后到账仍需可认领)
 MAX_BODY = 64 * 1024        # 请求体上限 64 KiB
 MAX_DELIVER = 5             # 单订单交付次数硬上限(含网络重试余量; 防 task_id 泄露无限白嫖)
 RATE_LIMIT = 5              # 每 IP 每窗口请求数
@@ -133,6 +135,10 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN sweep_at TEXT")
         if "fund_tx" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN fund_tx TEXT")
+        if "payment_exception" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN payment_exception TEXT")
+        if "refund_requested_at" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN refund_requested_at TEXT")
         # 迁移完成后再建索引(先补列再建索引, 避免旧库无列时报错)
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_addr_unique ON orders(receive_address)")
         # 旧架构迁移: 无独立地址的旧 pending 订单作废(旧共享地址+尾数架构已废弃)
@@ -230,8 +236,9 @@ def check_payment(db, order) -> dict | None:
     receive_addr = order["receive_address"]
     target_cents = order["amount_cents"]
     created_ms = order["created_at_ms"]
+    window_end = created_ms + (PAYMENT_WINDOW + LATE_PAY_GRACE) * 1000
     try:
-        txs = fetch_incoming_since(receive_addr, created_ms, created_ms + PAYMENT_WINDOW * 1000)
+        txs = fetch_incoming_since(receive_addr, created_ms, window_end)
     except Exception as e:
         log.warning("trongrid 查询失败: %s", e)
         return None
@@ -253,8 +260,8 @@ def check_payment(db, order) -> dict | None:
         if tok.get("address") != USDT_CONTRACT:
             continue
         blk_ms = int(tx.get("block_timestamp", 0) or 0)
-        # 时间窗: 订单创建后 PAYMENT_WINDOW 内(覆盖正常 + 过期补救)
-        if not (created_ms <= blk_ms <= created_ms + PAYMENT_WINDOW * 1000):
+        # 时间窗: [订单创建, 创建+付款窗口+迟到宽限](交易所提币风控审核常超 1 小时, 过期后到账仍需可认领)
+        if not (created_ms <= blk_ms <= window_end):
             continue
         try:
             dec = int(tok.get("decimals", 6))
@@ -517,6 +524,32 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, _rpc_error(rid, -32001, "task/payment mismatch"))
                     return
 
+                # 退款申请独立处理: 校验地址 + 登记, 不进入补发分支(退款与交付不能竞争)
+                refund_addr = payload.get("refundAddress")
+                if refund_addr is not None:
+                    if not isinstance(refund_addr, str) or not TRON_ADDR_RE.match(refund_addr):
+                        self._send(200, _rpc_error(rid, -32602, "invalid TRON refundAddress"))
+                        return
+                    if row["status"] == "refunded":
+                        self._send(200, _rpc_error(rid, -32007, "order refunded"))
+                        return
+                    db.execute(
+                        "UPDATE orders SET refund_address=?, refund_requested_at=? "
+                        "WHERE task_id=? AND status != 'refunded'",
+                        (refund_addr, _now_str(), row["task_id"]),
+                    )
+                    db.commit()
+                    self._send(200, _rpc_result(rid, _working(
+                        row["task_id"],
+                        "退款申请已登记，尚未执行退款。请勿继续补款；"
+                        "人工核验到账、退款金额和地址后处理。")))
+                    return
+
+                if row["refund_requested_at"]:
+                    self._send(200, _rpc_result(rid, _working(
+                        row["task_id"], "订单处于退款审核中，暂停自动交付；请联系支持。")))
+                    return
+
                 if row["status"] == "paid" and row["artifact"]:
                     # 已固化内容: 幂等重取, 但设硬上限(payment_id 虽是 secret, 防 task_id 泄露路径的无限白嫖)
                     if (row["delivered_count"] or 0) >= MAX_DELIVER:
@@ -546,7 +579,7 @@ class Handler(BaseHTTPRequestHandler):
                         "UPDATE orders SET status='paid', artifact=?, "
                         "paid_at=COALESCE(paid_at, ?), delivered_count=delivered_count+1 "
                         "WHERE task_id=? AND status IN ('paid','paid_undelivered','refund_requested') "
-                        "AND artifact IS NULL",
+                        "AND artifact IS NULL AND refund_requested_at IS NULL",
                         (brief, _now_str(), row["task_id"]))
                     if cur.rowcount == 0:
                         # 并发下已有其他请求固化,读取获胜内容返回
@@ -584,15 +617,20 @@ class Handler(BaseHTTPRequestHandler):
                         row["task_id"], "尚未检测到付款，请转账后重试。")))
                     return
 
-                # 少付: 明确告知差额(交易所提币常扣手续费), 不认领, 给补差或退款指引
+                # 少付: 记录异常, 不提示"补差"(自动路径只认单笔足额, 分笔累计需人工), 给人工/退款指引
                 if hit.get("short"):
+                    db.execute(
+                        "UPDATE orders SET payment_exception=? WHERE task_id=?",
+                        (json.dumps(hit, ensure_ascii=False), row["task_id"]),
+                    )
+                    db.commit()
                     shortfall = (hit["expected_raw"] - hit["paid_raw"]) / 1e6
                     self._send(200, _rpc_result(rid, _working(
                         row["task_id"],
-                        f"已检测到入账 {hit['paid_raw']/1e6:.6f} USDT, 少于订单金额 "
-                        f"{hit['expected_raw']/1e6:.2f} USDT（差 {shortfall:.6f}）。"
-                        f"注意：交易所提币通常扣 1 USDT 手续费，请按到账金额补足差额到同一地址 "
-                        f"{row['receive_address']}，或回传 refundAddress 申请退款。")))
+                        f"检测到一笔不足额到账 {hit['paid_raw']/1e6:.6f} USDT，"
+                        f"少于订单金额 {hit['expected_raw']/1e6:.2f} USDT（差 {shortfall:.6f}）。"
+                        f"当前自动支付不支持分笔累计，请勿继续补款；"
+                        f"请携 paymentId 联系支持，或回传 refundAddress 登记退款。")))
                     return
 
                 # 多付: 记录告警(不自动退回, 留人工退差/记 credit)
@@ -653,7 +691,7 @@ class Handler(BaseHTTPRequestHandler):
                 cur2 = db.execute(
                     "UPDATE orders SET artifact=?, delivered_count=delivered_count+1, status='paid' "
                     "WHERE task_id=? AND artifact IS NULL AND tx_hash=? "
-                    "AND status IN ('paid_undelivered','refund_requested')",
+                    "AND status IN ('paid_undelivered','refund_requested') AND refund_requested_at IS NULL",
                     (brief, row["task_id"], hit["tx_hash"]))
                 if cur2.rowcount == 0:
                     db.rollback()
@@ -718,7 +756,7 @@ class Handler(BaseHTTPRequestHandler):
                             "UPDATE orders SET status='paid', artifact=?, refund_address=NULL, "
                             "paid_at=COALESCE(paid_at, ?), delivered_count=delivered_count+1 "
                             "WHERE task_id=? AND status IN ('paid','paid_undelivered','refund_requested') "
-                            "AND artifact IS NULL",
+                            "AND artifact IS NULL AND refund_requested_at IS NULL",
                             (brief, _now_str(), client_task_id))
                         if cur.rowcount == 0:
                             db.rollback()
