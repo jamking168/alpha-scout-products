@@ -140,17 +140,21 @@ def recent_swept_orders(db):
         "AND sweep_at IS NOT NULL AND receive_address IS NOT NULL AND address_index IS NOT NULL"
     ).fetchall()
     out = []
-    hour_now = int(time.time() // 3600) % 24
+    hour_abs = int(time.time() // 3600)
+    hour_now = hour_abs % 24
     for r in rows:
         age = _age_seconds(r["sweep_at"])
-        if age >= 90 * 24 * 3600:
-            continue
         if age < 7 * 24 * 3600:
             out.append(r)  # 新鲜期: 每轮查
-        else:
-            bucket = zlib.crc32(r["task_id"].encode()) % 24  # 长尾期: 分桶摊薄
-            if bucket == hour_now:
+        elif age < 90 * 24 * 3600:
+            if zlib.crc32(r["task_id"].encode()) % 24 == hour_now:
+                out.append(r)  # 长尾期: 分桶摊薄, 每天一次
+        elif age < 365 * 24 * 3600:
+            # 超长尾期(90-365天): 每周查一次, 不以 90 天永久剔除——
+            # 否则已认领订单同地址 90 天后再入账永久漏扫(资金盲区, 无任何后续入口)。
+            if zlib.crc32(r["task_id"].encode()) % 168 == hour_abs % 168:
                 out.append(r)
+        # >= 365 天: 永久剔除(与 orphan_orders 窗口一致; 已被每周扫满一年, 再入账概率可忽略)
     return out
 
 
@@ -299,34 +303,39 @@ def _sweep_single(client: Tron, mnemonic: str, task_id: str, execute: bool) -> N
     if not execute:
         log(f"DRY-RUN {tid}… from={addr} -> {RECEIVE_ADDRESS} USDT={bal / 1e6:.2f}")
         return
-    # 充值 TRX(若不足): 复用主循环差额充值逻辑
+    # 充值 TRX(若不足): 先处理在途 fund_tx(守卫), 再读余额算差额(防旧余额重复充值)
+    # 1) 在途守卫: 已有 fund_tx 未终结时先判定(历史成功/明确失败 → 清标记; 未决 → HOLD)
+    if row["fund_tx"]:
+        fexists = tx_exists(client, row["fund_tx"])
+        if fexists is False:
+            if _age_seconds(row["fund_at"]) < 300:
+                log(f"FUND-HOLD {tid}… 在途充值 {row['fund_tx'][:12]}… 未过有效期, 等待过期(勿覆盖)")
+                return
+            log(f"FUND-RECOVER {tid}… 在途充值 {row['fund_tx'][:12]}… 已过有效期且链上查无, 允许重充")
+        else:
+            # 链上存在: 判定回执, 三分"历史成功"/"明确失败"/"未决"
+            ok_prev, rcpt_prev = wait_for_result(client, row["fund_tx"], timeout=15)
+            if ok_prev:
+                log(f"FUND-REUSE {tid}… 历史充值 {row['fund_tx'][:12]}… 已确认成功, 清 fund_tx 允许新一轮充值")
+                with db_conn() as db:
+                    db.execute("UPDATE orders SET fund_tx=NULL, fund_at=NULL WHERE task_id=?", (task_id,))
+                    db.commit()
+            elif rcpt_prev is not None and rcpt_prev.get("result") not in (None, "SUCCESS"):
+                # 明确执行失败(REVERT/OUT_OF_ENERGY): 有界恢复清 fund_tx 重试(与主循环 FUND-FAILED 同构, 防永久 HOLD)
+                log(f"FUND-FAILED {tid}… 充值 {row['fund_tx'][:12]}… 链上执行失败(result={rcpt_prev.get('result')}), 清 fund_tx 重试")
+                with db_conn() as db:
+                    db.execute("UPDATE orders SET fund_tx=NULL, fund_at=NULL WHERE task_id=?", (task_id,))
+                    db.commit()
+            else:
+                log(f"FUND-HOLD {tid}… 已有在途充值 {row['fund_tx'][:12]}… 状态={fexists}, 勿覆盖重充")
+                return
+    # 2) 现在读余额算差额(在途守卫处理后, 余额已是最新; 防"清标记后仍用旧 deficit 重复充值")
     trx = get_trx_balance(client, addr)
     if trx is None:
         log(f"ERROR: {tid}… TRX 余额查询失败")
         return
     deficit = TRX_FUND_SUN - trx
     if deficit > TRX_FUND_MIN_DEFICIT:
-        # 在途守卫: 已有 fund_tx 未终结时不得覆盖重充(防 F1/F2 先后上链重复出款)
-        if row["fund_tx"]:
-            fexists = tx_exists(client, row["fund_tx"])
-            if fexists is False:
-                if _age_seconds(row["fund_at"]) < 300:
-                    log(f"FUND-HOLD {tid}… 在途充值 {row['fund_tx'][:12]}… 未过有效期, 等待过期(勿覆盖)")
-                    return
-                log(f"FUND-RECOVER {tid}… 在途充值 {row['fund_tx'][:12]}… 已过有效期且链上查无, 允许重充")
-            else:
-                # 链上存在: 判定回执, 区分"历史成功已终结" vs "在途未决"(不能一律当在途)
-                ok_prev, _ = wait_for_result(client, row["fund_tx"], timeout=15)
-                if ok_prev:
-                    # 历史充值已确认成功(上一轮充值+归集闭环已完成), 使命已尽,
-                    # 允许清 fund_tx 后按最新余额重新充值(地址又收到新钱需新 TRX)。
-                    log(f"FUND-REUSE {tid}… 历史充值 {row['fund_tx'][:12]}… 已确认成功, 清 fund_tx 允许新一轮充值")
-                    with db_conn() as db:
-                        db.execute("UPDATE orders SET fund_tx=NULL, fund_at=NULL WHERE task_id=?", (task_id,))
-                        db.commit()
-                else:
-                    log(f"FUND-HOLD {tid}… 已有在途充值 {row['fund_tx'][:12]}… 状态={fexists}, 勿覆盖重充")
-                    return
         main_trx = get_trx_balance(client, RECEIVE_ADDRESS)
         if main_trx is None or main_trx - deficit < MAIN_TRX_FLOOR_SUN:
             log(f"ERROR: {tid}… 主地址 TRX 不足, 请先补 TRX")
