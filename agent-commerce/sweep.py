@@ -23,6 +23,7 @@ import os
 import sqlite3
 import sys
 import time
+import zlib
 
 from tronpy import Tron
 from tronpy.keys import PrivateKey
@@ -43,10 +44,10 @@ from a2a_server import (  # noqa: E402
 LOG_PATH = os.path.join(STATE_DIR, "sweep.log")
 LOCK_PATH = os.path.join(STATE_DIR, "sweep.lock")
 FEE_LIMIT_SUN = 8_000_000        # 8 TRX 烧 TRX 上限(实际约 3.2 TRX + 波动余量, 原 30 TRX 过宽)
-TRX_FUND_SUN = 5_000_000         # 充值目标 5 TRX: 3.2 TRX 转账 + 1.8 TRX 余量(原 15 TRX 会沉没 11.8 TRX/单)
+TRX_FUND_SUN = 9_000_000         # 充值目标 9 TRX: 必须严格 > FEE_LIMIT_SUN(8)+带宽余量, 否则能量价格波动期必 OUT_OF_ENERGY
 TRX_FUND_MIN_DEFICIT = 500_000   # 差额 < 0.5 TRX 不补(避免碎片充值)
-MIN_SWEEP_RAW = 1_500_000        # 归集阈值 $1.5: 覆盖 ~$1.1 链上成本 + 余量(每地址只收一单, 无"等积累")
-DUST_RAW = 1_000_000             # < $1 视为尘埃: 归集成本 > 币值, 标 DUST 终结不再复查(防 TronGrid 429 累积)
+MIN_SWEEP_RAW = 2_500_000        # 归集阈值 $2.5: 覆盖 9 TRX 成本(~$1.8) + 余量(每地址只收一单, 无"等积累")
+DUST_RAW = 1_500_000             # < $1.5 视为尘埃: 归集成本 > 币值, 标 DUST 终结不再复查(防 TronGrid 429 累积)
 TRX_DUST_SUN = 1_500_000         # 归集后子地址残余 TRX > 1.5 则回收(留 1.1 TRX 覆盖回收转账成本)
 MAIN_TRX_FLOOR_SUN = 50_000_000  # 主地址 TRX 低于 50 则停止充值(防主地址 TRX 漏光)
 
@@ -87,13 +88,13 @@ def ensure_schema(db) -> None:
 def pending_orders(db):
     """扫收到钱但未归集的订单(含 paid_undelivered / refund_requested, 这些地址上也有真金白银)。
 
-    排除 DUST 终结态(归集成本 > 币值, 永久放弃)。
+    排除 DUST/REVIEW 终结态(归集成本 > 币值, 永久放弃复查)。
     NO_BALANCE 地址做时间衰减复查: 创建 7 天内才复查(7 天后仍无钱基本不会再有了),
     否则订单累积后每轮 sweep 的 TronGrid 调用线性增长, 必撞 429。"""
     cutoff_ms = _now_ms() - 7 * 24 * 3600 * 1000
     return db.execute(
         "SELECT * FROM orders WHERE tx_hash IS NOT NULL AND receive_address IS NOT NULL "
-        "AND COALESCE(sweep_tx, '') != 'DUST' "
+        "AND COALESCE(sweep_tx, '') NOT IN ('DUST', 'REVIEW') "
         "AND (COALESCE(swept, 0) = 0 "
         "     OR (sweep_tx = 'NO_BALANCE' AND created_at_ms >= ?))",
         (cutoff_ms,),
@@ -117,12 +118,27 @@ def recent_swept_orders(db):
     """成功归集后 90 天内的地址, 复查是否再入账(重复付款/延迟到账的第二笔)。
 
     不把"某次归集成功"解释为"这个地址终生不再有余额": 归集后仍有到账会重新打开归集。
-    90 天覆盖交易所提币风控 + 用户手动重复付款的长尾延迟(7 天会漏掉大额审核转账)。"""
+    90 天覆盖交易所提币风控 + 用户手动重复付款的长尾延迟。
+
+    防 429: 分层复查。7 天内每轮查; 7-90 天用 task_id CRC32 分桶, 每 24 轮(≈每天)查一次,
+    避免"全量每轮扫"导致 TronGrid 调用无界增长 → 吃光配额 → 全局归集瘫痪。"""
     rows = db.execute(
         "SELECT * FROM orders WHERE swept=1 AND sweep_tx != 'NO_BALANCE' "
         "AND sweep_at IS NOT NULL AND receive_address IS NOT NULL AND address_index IS NOT NULL"
     ).fetchall()
-    return [r for r in rows if _age_seconds(r["sweep_at"]) < 90 * 24 * 3600]
+    out = []
+    hour_now = int(time.time() // 3600) % 24
+    for r in rows:
+        age = _age_seconds(r["sweep_at"])
+        if age >= 90 * 24 * 3600:
+            continue
+        if age < 7 * 24 * 3600:
+            out.append(r)  # 新鲜期: 每轮查
+        else:
+            bucket = zlib.crc32(r["task_id"].encode()) % 24  # 长尾期: 分桶摊薄
+            if bucket == hour_now:
+                out.append(r)
+    return out
 
 
 def get_trx_balance(client: Tron, addr: str):
@@ -351,19 +367,6 @@ def main() -> None:
                     "WHERE task_id=? AND COALESCE(payment_exception,'') NOT LIKE '%ORPHAN: bal=' || ? || '%'",
                     (f"ORPHAN: bal={bal} at={_now_str()}", o["task_id"], str(bal)))
                 db.commit()
-        # 再入账复查: 最近归集成功的地址, 检查是否重复付款/延迟到账(第二笔), 有则重新打开归集
-        for o in recent_swept_orders(db):
-            addr = o["receive_address"]
-            bal = get_usdt_balance(client, addr)
-            if bal is None:
-                continue
-            # 只有超过尘埃阈值的余额才重开归集(尘埃不再重开, 避免"DUST→复查→又DUST"的每轮循环)
-            if bal > DUST_RAW:
-                log(f"RE-ENTRY-ALERT: {o['task_id'][:12]}… addr={addr} 已归集后再入账 {bal/1e6:.6f}, 重新打开归集")
-                # 一并清 fund_tx: 否则历史成功充值会阻塞新一轮充值(FUND-HOLD 永久卡死)
-                db.execute("UPDATE orders SET swept=0, sweep_tx=NULL, sweep_at=NULL, fund_tx=NULL WHERE task_id=?",
-                           (o["task_id"],))
-                db.commit()
         orders = pending_orders(db)
         if not orders:
             log("无待归集订单")
@@ -398,9 +401,9 @@ def main() -> None:
                     if fail_cnt >= 3:
                         log(f"SWEEP-FAILED-HOLD {tid}… 连续 {fail_cnt} 次链上执行失败, 转人工处理(资源/权限核查)")
                         continue
-                    log(f"SWEEP-FAILED {tid}… tx={order['sweep_tx'][:12]}… 链上执行失败(result={receipt.get('result')}), 清 sweep_tx 重试({fail_cnt+1}/3)")
+                    log(f"SWEEP-FAILED {tid}… tx={order['sweep_tx'][:12]}… 链上执行失败(result={receipt.get('result')}), 清 sweep_tx+fund_tx 重试({fail_cnt+1}/3)")
                     db.execute(
-                        "UPDATE orders SET sweep_tx=NULL, sweep_at=NULL, "
+                        "UPDATE orders SET sweep_tx=NULL, sweep_at=NULL, fund_tx=NULL, "
                         "payment_exception = COALESCE(payment_exception || char(10), '') || ? WHERE task_id=?",
                         (f"SWEEP-FAILED attempt: result={receipt.get('result')} at={_now_str()}", order["task_id"]))
                     db.commit()
@@ -442,9 +445,15 @@ def main() -> None:
                     )
                     db.commit()
                 else:
-                    # $1.0–$1.5 灰区: 值得归集但需人工确认是否划算(少付/重复付款的残留)
+                    # 灰区: 余额低于归集阈值但高于尘埃, 不自动归集(成本不划算), 标 REVIEW 终结复查
+                    # (不写状态会让 swept=0 永久驻留 pending_orders, 每轮打 TronGrid → 429 → 全局瘫痪)
                     log(f"REVIEW {tid}… 余额 {bal / 1e6:.2f} USDT 在灰区 "
                         f"[${DUST_RAW / 1e6:.2f}, ${args.min_sweep / 1e6:.2f}), 人工决定是否 --min-sweep 强制归集")
+                    db.execute(
+                        "UPDATE orders SET swept=1, sweep_tx='REVIEW', sweep_at=? WHERE task_id=?",
+                        (_now_str(), order["task_id"]),
+                    )
+                    db.commit()
                 continue
             # 2. TRX 差额充值(幂等 + 恢复: 已有 fund_tx 但余额仍不足 → 链上查无此 tx 则清标记重充)
             trx = get_trx_balance(client, from_addr)
@@ -529,6 +538,32 @@ def main() -> None:
                         log(f"TRX-RECLAIM FAIL {tid}…: {e}")  # 非致命, 下轮再试
             else:
                 log(f"SWEEP REVERT {tid}… tx={txid} receipt={receipt}, 保留待人工核查")
+
+        # 再入账复查(主循环之后): 让真金白银的待归集订单优先消耗 API 配额。
+        # 最近归集成功的地址, 检查是否重复付款/延迟到账(第二笔), 有则重新打开归集
+        for o in recent_swept_orders(db):
+            addr = o["receive_address"]
+            bal = get_usdt_balance(client, addr)
+            if bal is None:
+                log(f"RE-ENTRY-RECHECK-FAIL {o['task_id'][:12]}… 余额查询失败(429/超时), 下轮重试")
+                continue
+            # 只有超过尘埃阈值的余额才重开归集(尘埃不再重开, 避免"DUST→复查→又DUST"的每轮循环)
+            if bal > DUST_RAW:
+                if o["tx_hash"]:
+                    # 已认领订单: 重开归集(pending_orders 下轮会扫到)
+                    log(f"RE-ENTRY-ALERT: {o['task_id'][:12]}… addr={addr} 已归集后再入账 {bal/1e6:.6f}, 重新打开归集")
+                    # 一并清 fund_tx: 否则历史成功充值会阻塞新一轮充值(FUND-HOLD 永久卡死)
+                    db.execute("UPDATE orders SET swept=0, sweep_tx=NULL, sweep_at=NULL, fund_tx=NULL WHERE task_id=?",
+                               (o["task_id"],))
+                    db.commit()
+                else:
+                    # 未认领孤儿(tx_hash IS NULL): 撤销 ORPHAN_RESOLVED 结案, 重新进入孤儿扫描(不伪造 tx_hash)
+                    log(f"ORPHAN-RE-ENTRY: {o['task_id'][:12]}… 已结案孤儿再入账 {bal/1e6:.6f}, 撤销结案重新进入孤儿扫描")
+                    db.execute(
+                        "UPDATE orders SET swept=0, sweep_tx=NULL, sweep_at=NULL, "
+                        "payment_exception = 'ORPHAN-RE-ENTRY: ' || COALESCE(payment_exception,'') WHERE task_id=?",
+                        (o["task_id"],))
+                    db.commit()
 
 
 if __name__ == "__main__":

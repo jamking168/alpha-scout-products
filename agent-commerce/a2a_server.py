@@ -890,13 +890,13 @@ class Handler(BaseHTTPRequestHandler):
                     cur2 = db.execute(
                         "UPDATE orders SET delivered_count=delivered_count+1, status='paid' "
                         "WHERE task_id=? AND artifact IS NULL AND tx_hash=? "
-                        "AND status IN ('paid_undelivered','refund_requested') AND refund_requested_at IS NULL",
+                        "AND status='paid_undelivered' AND refund_requested_at IS NULL",
                         (row["task_id"], hit["tx_hash"]))
                 else:
                     cur2 = db.execute(
                         "UPDATE orders SET artifact=?, delivered_count=delivered_count+1, status='paid' "
                         "WHERE task_id=? AND artifact IS NULL AND tx_hash=? "
-                        "AND status IN ('paid_undelivered','refund_requested') AND refund_requested_at IS NULL",
+                        "AND status='paid_undelivered' AND refund_requested_at IS NULL",
                         (brief, row["task_id"], hit["tx_hash"]))
                 if cur2.rowcount == 0:
                     db.rollback()
