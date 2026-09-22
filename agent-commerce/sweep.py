@@ -84,11 +84,13 @@ def ensure_schema(db) -> None:
         db.execute("ALTER TABLE orders ADD COLUMN fund_tx TEXT")
     if "fund_at" not in cols:
         db.execute("ALTER TABLE orders ADD COLUMN fund_at TEXT")
-        # 回填历史行: 旧充值 fund_tx 非空但 fund_at 为 NULL(第15轮之前落盘)。
-        # 以迁移时刻为首次观察时间, 保守等待安全期(5min)后进入链上恢复流程,
-        # 避免 _age_seconds(NULL)==0 导致永久 FUND-HOLD(既不当成已过期立即重出款, 也不永远等不完)。
-        db.execute("UPDATE orders SET fund_at=? WHERE fund_tx IS NOT NULL AND fund_at IS NULL",
-                   (_now_str(),))
+    # 回填历史行(独立于"新增列"条件, 每次运行幂等): 与 init_db 一致。
+    # 旧充值 fund_tx 非空但 fund_at 为 NULL(第15轮之前落盘) 以首次观察时间为准回填,
+    # 避免"列已存在但历史值 NULL"时永久 FUND-HOLD(不依赖部署顺序)。
+    db.execute(
+        "UPDATE orders SET fund_at=? WHERE fund_tx IS NOT NULL AND fund_tx <> '' AND fund_at IS NULL",
+        (_now_str(),),
+    )
     if "payment_exception" not in cols:
         db.execute("ALTER TABLE orders ADD COLUMN payment_exception TEXT")
     if "sku" not in cols:
@@ -304,6 +306,17 @@ def _sweep_single(client: Tron, mnemonic: str, task_id: str, execute: bool) -> N
         return
     deficit = TRX_FUND_SUN - trx
     if deficit > TRX_FUND_MIN_DEFICIT:
+        # 在途守卫: 已有 fund_tx 未终结时不得覆盖重充(防 F1/F2 先后上链重复出款)
+        if row["fund_tx"]:
+            fexists = tx_exists(client, row["fund_tx"])
+            if fexists is False:
+                if _age_seconds(row["fund_at"]) < 300:
+                    log(f"FUND-HOLD {tid}… 在途充值 {row['fund_tx'][:12]}… 未过有效期, 等待过期(勿覆盖)")
+                    return
+                log(f"FUND-RECOVER {tid}… 在途充值 {row['fund_tx'][:12]}… 已过有效期且链上查无, 允许重充")
+            else:
+                log(f"FUND-HOLD {tid}… 已有在途充值 {row['fund_tx'][:12]}… 状态={fexists}, 勿覆盖重充")
+                return
         main_trx = get_trx_balance(client, RECEIVE_ADDRESS)
         if main_trx is None or main_trx - deficit < MAIN_TRX_FLOOR_SUN:
             log(f"ERROR: {tid}… 主地址 TRX 不足, 请先补 TRX")
@@ -316,7 +329,10 @@ def _sweep_single(client: Tron, mnemonic: str, task_id: str, execute: bool) -> N
                 db.execute("UPDATE orders SET fund_tx=?, fund_at=? WHERE task_id=?", (ftx, _now_str(), task_id))
                 db.commit()
             fund_txn.broadcast()
-            wait_for_result(client, ftx)
+            ok_f, _ = wait_for_result(client, ftx)
+            if not ok_f:
+                log(f"TRX-FUND 未确认 {tid}… tx={ftx}, 停止(不继续归集, 防未确认就推进)")
+                return
             log(f"TRX-FUND {tid}… amount={deficit / 1e6:.2f}")
         except Exception as e:
             log(f"TRX-FUND FAIL {tid}…: {e}")

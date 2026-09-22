@@ -174,6 +174,14 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN fund_tx TEXT")
         if "fund_at" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN fund_at TEXT")
+        # 回填历史行(独立于"新增列"条件, 每次启动幂等执行):
+        # 旧充值 fund_tx 非空但 fund_at 为 NULL(第15轮之前落盘) 以首次观察时间为准回填。
+        # 必须放在这里而非"新增列"分支内——否则 server/reconcile 先启动补了列但不回填,
+        # sweep 的 ensure_schema 看到列已存在就跳过, 历史行 fund_at 永久 NULL → 永久 FUND-HOLD。
+        c.execute(
+            "UPDATE orders SET fund_at=? WHERE fund_tx IS NOT NULL AND fund_tx <> '' AND fund_at IS NULL",
+            (_now_str(),),
+        )
         if "payment_exception" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN payment_exception TEXT")
         if "refund_requested_at" not in cols:
