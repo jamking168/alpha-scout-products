@@ -321,10 +321,16 @@ def _sweep_single(client: Tron, mnemonic: str, task_id: str, execute: bool) -> N
                     db.execute("UPDATE orders SET fund_tx=NULL, fund_at=NULL WHERE task_id=?", (task_id,))
                     db.commit()
             elif rcpt_prev is not None and rcpt_prev.get("result") not in (None, "SUCCESS"):
-                # 明确执行失败(REVERT/OUT_OF_ENERGY): 有界恢复清 fund_tx 重试(与主循环 FUND-FAILED 同构, 防永久 HOLD)
-                log(f"FUND-FAILED {tid}… 充值 {row['fund_tx'][:12]}… 链上执行失败(result={rcpt_prev.get('result')}), 清 fund_tx 重试")
+                # 明确执行失败(REVERT/OUT_OF_ENERGY): 有界恢复清 fund_tx 重试(与主循环 FUND-FAILED 严格同构, 含 3 次熔断)
+                fund_fail_cnt = (row["payment_exception"] or "").count("FUND-FAILED:")
+                if fund_fail_cnt >= 3:
+                    log(f"FUND-FAILED-HOLD {tid}… 连续 {fund_fail_cnt} 次充值执行失败, 转人工处理(保留 fund_tx, 停止重充)")
+                    return
+                log(f"FUND-FAILED {tid}… 充值 {row['fund_tx'][:12]}… 链上执行失败(result={rcpt_prev.get('result')}), 清 fund_tx 重试({fund_fail_cnt + 1}/3)")
                 with db_conn() as db:
-                    db.execute("UPDATE orders SET fund_tx=NULL, fund_at=NULL WHERE task_id=?", (task_id,))
+                    db.execute("UPDATE orders SET fund_tx=NULL, fund_at=NULL, "
+                               "payment_exception = COALESCE(payment_exception || char(10), '') || ? WHERE task_id=?",
+                               (f"FUND-FAILED: result={rcpt_prev.get('result')} at={_now_str()}", task_id))
                     db.commit()
             else:
                 log(f"FUND-HOLD {tid}… 已有在途充值 {row['fund_tx'][:12]}… 状态={fexists}, 勿覆盖重充")
