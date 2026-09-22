@@ -368,10 +368,10 @@ def main() -> None:
                     (f"ORPHAN: bal={bal} at={_now_str()}", o["task_id"], str(bal)))
                 db.commit()
         orders = pending_orders(db)
-        if not orders:
+        if orders:
+            log(f"待归集订单 {len(orders)} 笔, 归集阈值 ${args.min_sweep / 1e6:.0f}")
+        else:
             log("无待归集订单")
-            return
-        log(f"待归集订单 {len(orders)} 笔, 归集阈值 ${args.min_sweep / 1e6:.0f}")
         for order in orders:
             idx = order["address_index"]
             from_addr = order["receive_address"]
@@ -472,7 +472,17 @@ def main() -> None:
                     # 若继续会用不足的 TRX 构建失败归集交易。下轮重新读 order(fund_tx=NULL) 再充值。
                     continue
                 else:
-                    # 已上链但余额仍不足(充值金额不够/到账延迟)或状态未知: 保守跳过本轮
+                    # 已上链但余额仍不足: 区分"已确认执行失败"(TRX 转账 REVERT) vs "存在但到账延迟/未决"
+                    ok_f, rcpt_f = wait_for_result(client, order["fund_tx"], timeout=15)
+                    if rcpt_f is not None and not ok_f:
+                        # 充值链上执行失败(REVERT): 清 fund_tx 重试(与 SWEEP-FAILED 同构, 防永久 FUND-HOLD)
+                        log(f"FUND-FAILED {tid}… 充值 tx={order['fund_tx'][:12]}… 链上执行失败(result={rcpt_f.get('result')}), 清 fund_tx 重试")
+                        db.execute(
+                            "UPDATE orders SET fund_tx=NULL, "
+                            "payment_exception = COALESCE(payment_exception || char(10), '') || ? WHERE task_id=?",
+                            (f"FUND-FAILED: result={rcpt_f.get('result')} at={_now_str()}", order["task_id"]))
+                        db.commit()
+                        continue  # 下轮重读 order 再充
                     log(f"FUND-HOLD {tid}… 充值 tx={order['fund_tx'][:12]}… 状态={fexists}, 保留待复核")
                     continue
             need_fund = deficit > TRX_FUND_MIN_DEFICIT and (order["fund_tx"] is None)
