@@ -113,15 +113,31 @@ def orphan_orders(db):
     ).fetchall()
 
 
+def recent_swept_orders(db):
+    """成功归集后 7 天内的地址, 复查是否再入账(重复付款/延迟到账的第二笔)。
+
+    不把"某次归集成功"解释为"这个地址终生不再有余额": 归集后仍有到账会重新打开归集。"""
+    rows = db.execute(
+        "SELECT * FROM orders WHERE swept=1 AND sweep_tx NOT IN ('DUST','NO_BALANCE') "
+        "AND sweep_at IS NOT NULL AND receive_address IS NOT NULL AND address_index IS NOT NULL"
+    ).fetchall()
+    return [r for r in rows if _age_seconds(r["sweep_at"]) < 7 * 24 * 3600]
+
+
 def get_trx_balance(client: Tron, addr: str):
-    """查 TRX 余额(sun)。返回 None 表示查询失败(不能当成余额 0); 返回 0 表示未激活/确实无 TRX。"""
+    """查 TRX 余额(sun)。返回 None 表示查询失败(不能当成余额 0); 返回 0 表示未激活/确实无 TRX。
+
+    关键陷阱: 不能用宽泛子串 "account"/"not found" 判未激活——tronpy 错误消息含 endpoint
+    /wallet/getaccount, 任何 500/502/超时都会命中而被误判为余额 0 → 重复充值 TRX。"""
     try:
         acc = client.get_account(addr)
         return int(acc.get("balance", 0))
     except Exception as e:
-        name = type(e).__name__
-        # 未激活账户(AddressNotFound): 视为余额 0(需激活, 由后续充值逻辑处理), 而非查询失败
-        if name == "AddressNotFound" or "not found" in str(e).lower() or "account" in str(e).lower():
+        if type(e).__name__ == "AddressNotFound":
+            return 0
+        s = str(e).lower()
+        # 只认明确"账户不存在"措辞, 不用宽泛子串
+        if "account not found" in s or "does not exist" in s:
             return 0
         return None
 
@@ -177,13 +193,19 @@ def wait_for_result(client: Tron, txid: str, timeout: int = 90):
 def tx_exists(client: Tron, txid: str):
     """返回 True=链上存在, False=链上明确不存在, None=查询失败(不确定)。
 
-    区分"明确未找到"(TransactionNotFound, 可安全重试) 与"网络/限流错误"(None, 保守 HOLD)。"""
+    关键陷阱: tronpy 对未上链 txid 的 get_transaction_info 返回 {} (HTTP 200, 非 None,
+    不抛异常)。必须用 `if not info` 判定, 否则空 dict 被当成"存在" → 归集恢复分支恒不触发。"""
     try:
         info = client.get_transaction_info(txid)
-        return info is not None
+        if not info:  # {} / None 都视为「链上无此交易」
+            return False
+        return True
     except Exception as e:
-        name = type(e).__name__
-        if name == "TransactionNotFound" or "not found" in str(e).lower():
+        if type(e).__name__ == "TransactionNotFound":
+            return False
+        s = str(e).lower()
+        # 只认明确"交易不存在"措辞, 不用宽泛 "not found"(会命中 404 Not Found 网络错误)
+        if "transaction not found" in s:
             return False
         return None
 
@@ -203,11 +225,83 @@ def _age_seconds(ts_str):
         return 0.0
 
 
+def _sweep_single(client: Tron, mnemonic: str, task_id: str, execute: bool) -> None:
+    """单笔强制归集: 人工确认归属后, 归集指定订单地址上的全部 USDT。
+
+    孤儿订单(tx_hash IS NULL 但地址有余额)的人工出路: 把"拿助记词手写脚本"降为"跑一条命令"。
+    用法: python3 sweep.py --task-id=<task_id> [--execute]  (默认 dry-run)"""
+    with db_conn() as db:
+        row = db.execute("SELECT * FROM orders WHERE task_id=?", (task_id,)).fetchone()
+    if not row:
+        log(f"ERROR: 无此订单 {task_id}")
+        return
+    idx = row["address_index"]
+    addr = row["receive_address"]
+    if idx is None or addr is None:
+        log(f"ERROR: 订单 {task_id} 缺 address_index/receive_address")
+        return
+    priv = hd_wallet.derive_private_key(mnemonic, idx)
+    main_priv = hd_wallet.derive_private_key(mnemonic, 0)
+    tid = task_id[:12]
+    bal = get_usdt_balance(client, addr)
+    if bal is None:
+        log(f"ERROR: {tid}… USDT 余额查询失败(429/超时), 稍后重试")
+        return
+    if bal <= 0:
+        log(f"SKIP {tid}… 地址无 USDT 余额")
+        return
+    if not execute:
+        log(f"DRY-RUN {tid}… from={addr} -> {RECEIVE_ADDRESS} USDT={bal / 1e6:.2f}")
+        return
+    # 充值 TRX(若不足): 复用主循环差额充值逻辑
+    trx = get_trx_balance(client, addr)
+    if trx is None:
+        log(f"ERROR: {tid}… TRX 余额查询失败")
+        return
+    deficit = TRX_FUND_SUN - trx
+    if deficit > TRX_FUND_MIN_DEFICIT:
+        main_trx = get_trx_balance(client, RECEIVE_ADDRESS)
+        if main_trx is None or main_trx - deficit < MAIN_TRX_FLOOR_SUN:
+            log(f"ERROR: {tid}… 主地址 TRX 不足, 请先补 TRX")
+            return
+        try:
+            fund_txn = build_trx_transfer(client, RECEIVE_ADDRESS, main_priv, addr, deficit)
+            ftx = fund_txn.txid
+            fund_txn.broadcast()
+            wait_for_result(client, ftx)
+            log(f"TRX-FUND {tid}… amount={deficit / 1e6:.2f}")
+        except Exception as e:
+            log(f"TRX-FUND FAIL {tid}…: {e}")
+            return
+    # 归集 USDT
+    try:
+        usdt_txn = build_transfer(client, addr, priv, RECEIVE_ADDRESS, bal)
+        txid = usdt_txn.txid
+        with db_conn() as db:
+            db.execute("UPDATE orders SET sweep_tx=?, sweep_at=? WHERE task_id=?", (txid, _now_str(), task_id))
+            db.commit()
+        usdt_txn.broadcast()
+    except Exception as e:
+        log(f"SWEEP FAIL {tid}…: {e}")
+        return
+    ok, _ = wait_for_result(client, txid)
+    if ok:
+        with db_conn() as db:
+            db.execute("UPDATE orders SET swept=1, sweep_tx=?, sweep_at=? WHERE task_id=?",
+                       (txid, _now_str(), task_id))
+            db.commit()
+        log(f"SWEPT {tid}… tx={txid} amount={bal / 1e6:.2f}")
+    else:
+        log(f"SWEEP 未确认 {tid}… tx={txid}, 保留待复核")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--execute", action="store_true", help="真实广播(默认 dry-run)")
     ap.add_argument("--min-sweep", type=int, default=MIN_SWEEP_RAW,
                     help=f"归集阈值(raw, 默认 {MIN_SWEEP_RAW} = $50)")
+    ap.add_argument("--task-id", type=str, default=None,
+                    help="单笔强制归集指定订单地址的 USDT(孤儿资金人工出路; 配合 --execute 才真实广播)")
     args = ap.parse_args()
 
     lock = acquire_lock()
@@ -221,6 +315,12 @@ def main() -> None:
     hd_wallet.verify_wallet(RECEIVE_ADDRESS)
 
     client = Tron(HTTPProvider(endpoint_uri="https://api.trongrid.io"))
+
+    # 单笔强制归集: 人工确认归属后, 归集指定订单地址(孤儿资金出路), 不跑全量
+    if args.task_id:
+        _sweep_single(client, mnemonic, args.task_id, args.execute)
+        return
+
     with db_conn() as db:
         ensure_schema(db)
         # 孤儿扫描: 未认领但地址有余额的订单(付款超窗/对账漏扫) → 告警, 不自动归集(归属未定, 人工决定)
@@ -234,8 +334,24 @@ def main() -> None:
                 continue
             if bal > 0:
                 log(f"ORPHAN-ALERT: {o['task_id'][:12]}… addr={addr} 未认领但有 USDT 余额 {bal/1e6:.6f}, 人工决定补发/退款")
-                db.execute("UPDATE orders SET payment_exception=? WHERE task_id=?",
-                           (f"ORPHAN: bal={bal} at={_now_str()}", o["task_id"]))
+                # 追加不覆写: payment_exception 里可能已有少付明细(人工退款唯一凭证), 覆写会丢凭证
+                # 余额不变时不重复追加(避免每轮刷屏)
+                db.execute(
+                    "UPDATE orders SET payment_exception = "
+                    "COALESCE(payment_exception || char(10), '') || ? "
+                    "WHERE task_id=? AND COALESCE(payment_exception,'') NOT LIKE '%ORPHAN: bal=' || ? || '%'",
+                    (f"ORPHAN: bal={bal} at={_now_str()}", o["task_id"], str(bal)))
+                db.commit()
+        # 再入账复查: 最近归集成功的地址, 检查是否重复付款/延迟到账(第二笔), 有则重新打开归集
+        for o in recent_swept_orders(db):
+            addr = o["receive_address"]
+            bal = get_usdt_balance(client, addr)
+            if bal is None:
+                continue
+            if bal > 0:
+                log(f"RE-ENTRY-ALERT: {o['task_id'][:12]}… addr={addr} 已归集后再入账 {bal/1e6:.6f}, 重新打开归集")
+                db.execute("UPDATE orders SET swept=0, sweep_tx=NULL, sweep_at=NULL WHERE task_id=?",
+                           (o["task_id"],))
                 db.commit()
         orders = pending_orders(db)
         if not orders:
@@ -304,12 +420,23 @@ def main() -> None:
                     log(f"REVIEW {tid}… 余额 {bal / 1e6:.2f} USDT 在灰区 "
                         f"[${DUST_RAW / 1e6:.2f}, ${args.min_sweep / 1e6:.2f}), 人工决定是否 --min-sweep 强制归集")
                 continue
-            # 2. TRX 差额充值(幂等: 已有 fund_tx 则跳过)
+            # 2. TRX 差额充值(幂等 + 恢复: 已有 fund_tx 但余额仍不足 → 链上查无此 tx 则清标记重充)
             trx = get_trx_balance(client, from_addr)
             if trx is None:
                 log(f"SKIP {tid}… TRX 余额查询失败, 保留待重试")
                 continue
             deficit = TRX_FUND_SUN - trx
+            if order["fund_tx"] and deficit > TRX_FUND_MIN_DEFICIT:
+                # 有充值记录但余额仍不足: 上次充值可能未上链(广播前崩溃/交易过期)
+                fexists = tx_exists(client, order["fund_tx"])
+                if fexists is False:
+                    log(f"FUND-RECOVER {tid}… 充值 tx={order['fund_tx'][:12]}… 链上查无此交易, 清 fund_tx 重新充")
+                    db.execute("UPDATE orders SET fund_tx=NULL WHERE task_id=?", (order["task_id"],))
+                    db.commit()
+                else:
+                    # 已上链但余额仍不足(充值金额不够/到账延迟)或状态未知: 保守跳过本轮
+                    log(f"FUND-HOLD {tid}… 充值 tx={order['fund_tx'][:12]}… 状态={fexists}, 保留待复核")
+                    continue
             need_fund = deficit > TRX_FUND_MIN_DEFICIT and (order["fund_tx"] is None)
             # 3. dry-run
             if not args.execute:

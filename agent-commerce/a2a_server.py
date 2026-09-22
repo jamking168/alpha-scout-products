@@ -304,18 +304,30 @@ def gen_sample_brief() -> str:
 
 
 def fetch_incoming_since(address: str, min_ts_ms: int, max_ts_ms: int | None = None) -> list:
-    """查指定地址在 [min_ts_ms, max_ts_ms] 窗口内到账的 USDT-TRC20。"""
-    url = (f"{TRON_API}/accounts/{address}/transactions/trc20"
-           f"?only_confirmed=true&limit=200&contract_address={USDT_CONTRACT}"
-           f"&min_timestamp={min_ts_ms}&order_by=block_timestamp,asc")
+    """查指定地址在 [min_ts_ms, max_ts_ms] 窗口内到账的 USDT-TRC20, 自动遍历分页。
+
+    单页最多 200 条; 窗口内 >200 条时若不分页, 第 201 条后的足额付款会永久漏认。"""
+    base = (f"{TRON_API}/accounts/{address}/transactions/trc20"
+            f"?only_confirmed=true&limit=200&contract_address={USDT_CONTRACT}"
+            f"&min_timestamp={min_ts_ms}&order_by=block_timestamp,asc")
     if max_ts_ms:
-        url += f"&max_timestamp={max_ts_ms}"
-    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
-    with urllib.request.urlopen(req, timeout=8) as r:
-        payload = json.load(r)
-    if not payload.get("success", True):
-        raise RuntimeError(f"trongrid error: {payload.get('error')}")
-    return payload.get("data", [])
+        base += f"&max_timestamp={max_ts_ms}"
+    all_txs = []
+    fingerprint = None
+    while True:
+        url = base + (f"&fingerprint={fingerprint}" if fingerprint else "")
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            payload = json.load(r)
+        if not payload.get("success", True):
+            raise RuntimeError(f"trongrid error: {payload.get('error')}")
+        page = payload.get("data", [])
+        all_txs.extend(page)
+        # 分页续查: meta.fingerprint 存在则还有下一页
+        fingerprint = (payload.get("meta") or {}).get("fingerprint")
+        if not fingerprint or len(page) < 200:
+            break
+    return all_txs
 
 
 def check_payment(db, order) -> dict | None:
@@ -650,9 +662,12 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(200, _rpc_error(rid, -32007, "order refunded"))
                         return
                     # 条件 UPDATE 原子登记退款: 已交付/退款中的订单拒绝自助退款(防"既拿货又退款"的 TOCTOU 竞态)
+                    # 同时冻结权益(status='refund_requested' + access_until_ms=0), 防人工退款后误清
+                    # refund_requested_at 导致订阅权益复活(第二道独立防线)
                     cur = db.execute(
-                        "UPDATE orders SET refund_address=?, refund_requested_at=? "
-                        "WHERE task_id=? AND status != 'refunded' "
+                        "UPDATE orders SET refund_address=?, refund_requested_at=?, "
+                        "status='refund_requested', access_until_ms=0 "
+                        "WHERE task_id=? AND status IN ('pending','expired','paid','paid_undelivered') "
                         "AND COALESCE(delivered_count,0)=0 AND (artifact IS NULL OR artifact='')",
                         (refund_addr, _now_str(), row["task_id"]),
                     )
