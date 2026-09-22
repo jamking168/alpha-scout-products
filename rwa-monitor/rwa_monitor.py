@@ -189,11 +189,13 @@ def main():
         if i % 10 == 0:
             print(f"    ... {i}/{len(targets)}")
 
-    # 板块 30d/7d 净流动: 用有历史数据的头部协议求和(近似全板块)
+    # 板块 30d/7d TVL 变化: 用有历史数据的头部协议求和(近似全板块)
+    # ⚠️ TVL 变化 ≠ 真实资金流: 可能来自资产价格/汇率、利息累计、抵押结构、
+    #    协议迁移/重分类等,不可直接解读为"申购/赎回净额"。
     flow = {}
     for w in args.window:
         vals = [d["changes"].get(f"{w}d_abs") for d in details if d["changes"].get(f"{w}d_abs") is not None]
-        flow[f"{w}d_net_usd"] = round(sum(vals), 2) if vals else None
+        flow[f"{w}d_tvl_change_usd"] = round(sum(vals), 2) if vals else None
         flow[f"{w}d_protocols_count"] = len(vals)
 
     # 覆盖度: 有历史数据的协议当前 TVL 之和 / 板块总量
@@ -218,7 +220,7 @@ def main():
             "total_tvl_usd": round(total_tvl, 2),
             "total_defi_tvl_usd": round(total_defi, 2) if total_defi else None,
             "rwa_share_of_defi_pct": round(total_tvl / total_defi * 100, 2) if total_defi else None,
-            "coverage_of_flow_estimate_pct": coverage,
+            "coverage_of_tvl_change_estimate_pct": coverage,
             "flow": flow,
         },
         "windows_days": args.window,
@@ -237,7 +239,7 @@ def main():
 
     # ---- 中文摘要 ----
     print("\n" + "=" * 62)
-    print("RWA 板块资金流快照(DeFiLlama 链上一手)")
+    print("RWA 板块 TVL 变化快照(DeFiLlama 一手数据)")
     print("=" * 62)
     print(f"生成时间(UTC) : {snapshot['generated_at_iso']}")
     print(f"RWA 协议总数   : {len(rwa)} (有 TVL {len(tracked)},未跟踪 {len(untracked)})")
@@ -245,19 +247,20 @@ def main():
     if total_defi:
         print(f"全 DeFi 总 TVL : ${total_defi:,.0f} ({total_defi/1e9:.3f}B), RWA 占比 {total_tvl/total_defi*100:.2f}%")
     for w in args.window:
-        net = flow.get(f"{w}d_net_usd")
+        net = flow.get(f"{w}d_tvl_change_usd")
         if net is not None:
-            direction = "流入" if net > 0 else "流出"
-            print(f"{w:2d}天净资金变化: {direction} ${net:+,.0f} ({net/1e6:+.1f}M), 覆盖 {flow[f'{w}d_protocols_count']} 个头部协议 / 覆盖率 {coverage:.1f}%")
+            direction = "增加" if net > 0 else "减少"
+            print(f"{w:2d}天 TVL 变化: {direction} ${net:+,.0f} ({net/1e6:+.1f}M), 覆盖 {flow[f'{w}d_protocols_count']} 个头部协议 / 覆盖率 {coverage:.1f}%")
     print("-" * 62)
     for w in args.window:
         top3 = _rank(w)[:3]
         bot3 = _rank(w)[-3:]
-        print(f"{w}天净流入前三: " + " ; ".join(
+        print(f"{w}天 TVL 增加前三: " + " ; ".join(
             f"{d['name']} ${d['changes'][f'{w}d_abs']:+,.0f}" for d in top3))
-        print(f"{w}天净流出前三: " + " ; ".join(
+        print(f"{w}天 TVL 减少前三: " + " ; ".join(
             f"{d['name']} ${d['changes'][f'{w}d_abs']:+,.0f}" for d in bot3))
     print("=" * 62)
+    print("⚠️ TVL 变化仅反映锁仓价值变动,不构成资金流入/流出结论;异动需第二源核验。")
     return snapshot
 
 

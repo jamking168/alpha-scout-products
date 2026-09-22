@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
-"""A2A Merchant Agent 服务（最小实现 · x402 TRON USDT 付费）
+"""A2A Merchant Agent 服务（x402 TRON USDT 付费）— v2 修复版
 
 端点:
 - GET  /.well-known/agent-card.json  -> A2A Agent Card（发现入口）
 - POST /a2a/v1                      -> JSON-RPC 2.0 message/send（调用 + 付费闭环）
 
-付费: TRON USDT(TRC-20)「唯一金额尾数匹配」，与 revenue 收款底座同款机制。
-第一个付费能力: 每日情报简报（$5/次）。
+付费: TRON USDT(TRC-20)「唯一金额尾数匹配」。
+金额全程用整数「分」(cents) 计算，杜绝浮点误差。
 
-协议参考: A2A v1.0 + A2A-x402 v0.1 扩展。
+v2 修复（对应审查报告 P0）:
+- P0-3  支付字段从交易顶层读（to/value/type），非 token_info
+- P0-2  min_timestamp 用毫秒；查询窗口对齐订单创建时间
+- P0-2  尾数改整数槽位 + 过期回收 + 容量上限（无死循环，满则 503）
+- P0-1  tx_hash 唯一约束 + 条件更新（乐观锁）原子认领
+- P0    订单所有权：高熵 task_id/payment_id（secrets.token_urlsafe）
+- P0-5  交付失败不结单（paid_undelivered），不返回占位内容
+- P0    交付物固化（artifact 落库），按次购买不变成无限订阅
+- P0    JSON-RPC 成功响应统一 envelope；错误用标准错误码
+- P0    请求体大小校验、幂等、每 IP 限流
+- P1    SQLite WAL + busy_timeout + 连接治理
 """
 import json
+import logging
 import os
-import random
+import secrets
 import sqlite3
-import sys
 import time
 import urllib.request
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -29,101 +40,162 @@ USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 TRON_API = "https://api.trongrid.io/v1"
 INTEL_DB = "/home/jam/.hermes/profiles/alpha-scout/state/intel_library.db"
 
-PRICE_USD = 5          # 每日情报简报定价
-PAYMENT_WINDOW = 900   # 付款窗口 15 分钟
+PRICE_CENTS = 500          # $5.00 = 500 分
+TAIL_MIN, TAIL_MAX = 1, 99  # 尾数 1–99 分（即 $0.01–$0.99）
+PAYMENT_WINDOW = 900        # 付款窗口 15 分钟
+MAX_BODY = 64 * 1024        # 请求体上限 64 KiB
+MAX_DELIVER = 3             # 单订单交付次数上限
+RATE_LIMIT = 5              # 每 IP 每窗口请求数
+RATE_WINDOW = 60            # 限流窗口秒
 LISTEN = ("127.0.0.1", 8898)
 
+log = logging.getLogger("a2a")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-def _db():
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS orders (
+    task_id        TEXT PRIMARY KEY,
+    payment_id     TEXT UNIQUE,
+    tail_cents     INTEGER,
+    amount_cents   INTEGER,
+    status         TEXT DEFAULT 'pending',
+    created_at_ms  INTEGER,
+    expires_at_ms  INTEGER,
+    paid_at        TEXT,
+    tx_hash        TEXT UNIQUE,
+    artifact       TEXT,
+    delivered_count INTEGER DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_tail_active
+    ON orders(tail_cents) WHERE status='pending';
+"""
+
+
+@contextmanager
+def db_conn(path=DB_PATH, readonly=False):
     os.makedirs(STATE_DIR, exist_ok=True)
-    c = sqlite3.connect(DB_PATH)
-    c.execute("""CREATE TABLE IF NOT EXISTS orders (
-        task_id TEXT PRIMARY KEY,
-        payment_id TEXT,
-        tail TEXT,
-        amount REAL,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT,
-        paid_at TEXT,
-        tx_hash TEXT
-    )""")
-    c.commit()
-    return c
+    if readonly:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+    else:
+        c = sqlite3.connect(path, timeout=10)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=8000")
+        c.execute("PRAGMA synchronous=NORMAL")
+    c.row_factory = sqlite3.Row
+    try:
+        yield c
+    finally:
+        c.close()
 
 
-def _now():
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+def init_db():
+    with db_conn() as c:
+        c.executescript(SCHEMA)
+        c.commit()
 
 
-def gen_tail():
-    """生成不重复的唯一金额尾数 (0.01-0.99)。"""
-    db = _db()
-    while True:
-        tail = round(random.uniform(0.01, 0.99), 2)
-        if not db.execute("SELECT 1 FROM orders WHERE tail=?", (str(tail),)).fetchone():
-            return tail
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+class BriefUnavailable(Exception):
+    """情报源暂不可用，不能交付。"""
+
+
+def gen_tail(db) -> int | None:
+    """从未过期且未占用的尾数中随机取一个；满则返回 None（触发 503 排队）。"""
+    now_ms = _now_ms()
+    db.execute("UPDATE orders SET status='expired' WHERE status='pending' AND expires_at_ms <= ?",
+               (now_ms,))
+    db.commit()
+    used = {r[0] for r in db.execute("SELECT tail_cents FROM orders WHERE status='pending'")}
+    free = [t for t in range(TAIL_MIN, TAIL_MAX + 1) if t not in used]
+    if not free:
+        return None
+    return secrets.choice(free)
 
 
 def gen_intel_brief() -> str:
-    """生成每日情报简报（读真实 intel_library.db 的最新 GO 信号）。"""
-    lines = []
-    lines.append("## 千里眼 · 每日情报简报")
-    lines.append("")
+    """生成简报。情报源不可用或无可交付信号时抛 BriefUnavailable，绝不返回占位。"""
     try:
-        c = sqlite3.connect(INTEL_DB)
-        rows = c.execute(
-            "SELECT date, memo_title, verdict, category FROM intel_memo "
-            "WHERE verdict='GO' ORDER BY created_at DESC LIMIT 6"
-        ).fetchall()
-        if rows:
-            lines.append("### 当前 GO 级信号（可落地方向）")
-            for date, title, verdict, cat in rows:
-                lines.append(f"- [{cat or 'N/A'}] {title}（{date}）")
-        else:
-            lines.append("（暂无可落地信号，详见后续更新）")
-        c.close()
+        with db_conn(path=INTEL_DB, readonly=True) as c:
+            rows = c.execute(
+                "SELECT date, memo_title, category FROM intel_memo "
+                "WHERE verdict='GO' ORDER BY created_at DESC LIMIT 6"
+            ).fetchall()
     except Exception as e:
-        lines.append(f"（情报库读取失败，占位内容）")
-    lines.append("")
-    lines.append("---")
-    lines.append("本简报由千里眼 agent 集群自动生成，不构成投资建议。")
+        raise BriefUnavailable(f"情报库读取失败: {e}") from e
+    if not rows:
+        raise BriefUnavailable("当前无可交付的 GO 级信号")
+    lines = ["## 千里眼 · 每日情报简报", "", "### 当前 GO 级信号（可落地方向）"]
+    for r in rows:
+        lines.append(f"- [{r['category'] or 'N/A'}] {r['memo_title']}（{r['date']}）")
+    lines += ["", "---", "本简报由千里眼 agent 集群自动生成，不构成投资建议。"]
     return "\n".join(lines)
 
 
-def fetch_incoming_since(min_ts: int) -> list:
-    """查收款地址最近到账的 USDT-TRC20。"""
+def fetch_incoming_since(min_ts_ms: int) -> list:
+    """查收款地址在 min_ts_ms 之后到账的 USDT-TRC20。min_timestamp 为毫秒。"""
     url = (f"{TRON_API}/accounts/{RECEIVE_ADDRESS}/transactions/trc20"
-           f"?only_confirmed=true&limit=50&contract_address={USDT_CONTRACT}"
-           f"&min_timestamp={min_ts}&order_by=block_timestamp,asc")
+           f"?only_confirmed=true&limit=200&contract_address={USDT_CONTRACT}"
+           f"&min_timestamp={min_ts_ms}&order_by=block_timestamp,asc")
     req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
     with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r).get("data", [])
+        payload = json.load(r)
+    if not payload.get("success", True):
+        raise RuntimeError(f"trongrid error: {payload.get('error')}")
+    return payload.get("data", [])
 
 
-def check_payment(order: dict) -> dict | None:
-    """查 TronGrid 验证一笔订单是否已到账（按唯一金额精确匹配）。"""
-    target = order["amount"]  # 如 5.37
+def check_payment(db, order) -> dict | None:
+    """按整数金额精确匹配 + tx_hash 去重 + 时间窗校验。"""
+    target_cents = order["amount_cents"]
+    created_ms = order["created_at_ms"]
     try:
-        txs = fetch_incoming_since(int(time.time()) - PAYMENT_WINDOW * 4)
-    except Exception:
+        txs = fetch_incoming_since(created_ms)
+    except Exception as e:
+        log.warning("trongrid 查询失败: %s", e)
         return None
     for tx in txs:
-        tok = tx.get("token_info", {})
-        if tok.get("to") != RECEIVE_ADDRESS:
+        txid = tx.get("transaction_id", "")
+        if not txid:
+            continue
+        # 该交易是否已被任何订单消费
+        if db.execute("SELECT 1 FROM orders WHERE tx_hash=?", (txid,)).fetchone():
+            continue
+        # 字段在交易顶层，非 token_info
+        if tx.get("to") != RECEIVE_ADDRESS:
+            continue
+        if tx.get("type") != "Transfer":
+            continue
+        tok = tx.get("token_info") or {}
+        if tok.get("address") != USDT_CONTRACT:
+            continue
+        blk_ms = int(tx.get("block_timestamp", 0) or 0)
+        if not (created_ms <= blk_ms <= created_ms + PAYMENT_WINDOW * 1000):
             continue
         try:
-            amt = round(int(tok.get("value", "0")) / 1e6, 2)
+            dec = int(tok.get("decimals", 6))
+            amt_cents = int(tx.get("value", "0")) * 100 // (10 ** dec)
         except (ValueError, TypeError):
             continue
-        if abs(amt - target) < 0.001:
-            return {"tx_hash": tx.get("transaction_id", ""), "amount": amt}
+        if amt_cents != target_cents:
+            continue
+        return {"tx_hash": txid, "amount_cents": amt_cents}
     return None
 
 
-def _payment_required(task_id: str, payment_id: str, tail: float) -> dict:
-    """构造 x402 payment-required Task。"""
-    amount = round(PRICE_USD + tail, 2)          # 如 5.37
-    raw = str(int(round(amount * 1e6)))           # 5370000（6 位小数最小单位）
+def _rpc_result(rid, value):
+    return {"jsonrpc": "2.0", "id": rid, "result": value}
+
+
+def _rpc_error(rid, code, message):
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+
+
+def _payment_required(task_id: str, payment_id: str, amount_cents: int) -> dict:
+    amount_usd = amount_cents / 100
+    raw = str(amount_cents * 10000)  # 6 位小数最小单位
     return {
         "kind": "task",
         "id": task_id,
@@ -134,7 +206,7 @@ def _payment_required(task_id: str, payment_id: str, tail: float) -> dict:
                 "role": "agent",
                 "parts": [{
                     "kind": "text",
-                    "text": (f"解锁「每日情报简报」需支付 {amount} USDT (TRC-20) 到 "
+                    "text": (f"解锁「每日情报简报」需支付 {amount_usd:.2f} USDT (TRC-20) 到 "
                              f"{RECEIVE_ADDRESS}。付款后回传 paymentId 即可获取简报。")
                 }],
                 "metadata": {
@@ -151,9 +223,9 @@ def _payment_required(task_id: str, payment_id: str, tail: float) -> dict:
                             "extra": {
                                 "name": "Tether USD (TRC-20)",
                                 "paymentId": payment_id,
-                                "tail": str(tail),
-                                "amount": str(amount),
-                                "matching": "unique-decimal-tail (0.01-0.99)"
+                                "amountCents": str(amount_cents),
+                                "amountUsd": f"{amount_usd:.2f}",
+                                "matching": "unique-decimal-tail (1-99 cents)"
                             }
                         }]
                     }
@@ -164,7 +236,6 @@ def _payment_required(task_id: str, payment_id: str, tail: float) -> dict:
 
 
 def _completed(task_id: str, text: str, receipt: dict) -> dict:
-    """构造 payment-completed Task（含交付内容）。"""
     return {
         "kind": "task",
         "id": task_id,
@@ -188,12 +259,33 @@ def _completed(task_id: str, text: str, receipt: dict) -> dict:
     }
 
 
-def _err(id_, text: str):
-    return {"jsonrpc": "2.0", "id": id_, "error": {"code": -32000, "message": text}}
+def _working(task_id: str, text: str) -> dict:
+    return {
+        "kind": "task", "id": task_id, "status": {
+            "state": "working",
+            "message": {"kind": "message", "role": "agent",
+                        "parts": [{"kind": "text", "text": text}],
+                        "metadata": {"x402.payment.status": "payment-submitted"}}}
+    }
+
+
+# 内存限流（单进程；生产建议 Redis / Nginx limit_req）
+_RATE = {}
+
+
+def _allow(ip: str) -> bool:
+    now = time.time()
+    q = [t for t in _RATE.get(ip, []) if now - t < RATE_WINDOW]
+    if len(q) >= RATE_LIMIT:
+        _RATE[ip] = q
+        return False
+    q.append(now)
+    _RATE[ip] = q
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, code: int, obj):
+    def _send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -201,8 +293,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *a):
-        pass  # 静默
+    def log_message(self, fmt, *args):
+        log.info("%s %s", self.address_string(), fmt % args)
 
     def do_GET(self):
         if self.path.rstrip("/") == "/.well-known/agent-card.json":
@@ -216,76 +308,172 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path.rstrip("/") != "/a2a/v1":
-            self._send(404, {"error": "not found"})
+        ip = self.client_address[0]
+        if not _allow(ip):
+            self._send(429, _rpc_error(None, -32005, "rate limited"))
             return
-        length = int(self.headers.get("Content-Length", 0))
+        if self.path.rstrip("/") != "/a2a/v1":
+            self._send(404, _rpc_error(None, -32601, "not found"))
+            return
+
+        # 请求体大小校验
         try:
-            req = json.loads(self.rfile.read(length) or b"{}")
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send(400, _rpc_error(None, -32700, "bad Content-Length"))
+            return
+        if length <= 0 or length > MAX_BODY:
+            self._send(413, _rpc_error(None, -32700, "payload too large"))
+            return
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            self._send(400, _rpc_error(None, -32700, "incomplete body"))
+            return
+
+        try:
+            req = json.loads(raw or b"{}")
         except json.JSONDecodeError:
-            self._send(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+            self._send(400, _rpc_error(None, -32700, "parse error"))
+            return
+        if not isinstance(req, dict):
+            self._send(400, _rpc_error(None, -32600, "invalid request"))
             return
 
         rid = req.get("id")
         method = req.get("method")
         if method != "message/send":
-            self._send(200, _err(rid, f"unsupported method: {method}"))
+            self._send(200, _rpc_error(rid, -32601, f"unsupported method: {method}"))
             return
 
-        params = req.get("params", {})
-        msg = params.get("message", {})
-        task_id = msg.get("taskId") or f"task-{os.urandom(4).hex()}"
-        meta = msg.get("metadata", {})
-        db = _db()
+        params = req.get("params") or {}
+        if not isinstance(params, dict):
+            self._send(200, _rpc_error(rid, -32602, "invalid params"))
+            return
+        msg = params.get("message") or {}
+        if not isinstance(msg, dict):
+            self._send(200, _rpc_error(rid, -32602, "invalid message"))
+            return
+        meta = msg.get("metadata") or {}
+        client_task_id = msg.get("taskId")
 
-        # --- 分支1: 带付款提交 -> 验证到账 -> 交付 ---
-        if meta.get("x402.payment.status") == "payment-submitted":
-            payload = meta.get("x402.payment.payload", {})
-            pid = payload.get("paymentId", "")
-            row = db.execute("SELECT * FROM orders WHERE task_id=? OR payment_id=?",
-                             (task_id, pid)).fetchone()
-            if not row:
-                self._send(200, _err(rid, "unknown payment id"))
-                return
-            order = dict(zip(
-                ["task_id", "payment_id", "tail", "amount", "status", "created_at", "paid_at", "tx_hash"],
-                row))
-            if order["status"] == "paid":
-                brief = gen_intel_brief()
-                self._send(200, _completed(task_id, brief,
-                    {"success": True, "transaction": order["tx_hash"], "network": "tron-mainnet"}))
-                return
-            hit = check_payment(order)
-            if hit:
-                db.execute("UPDATE orders SET status='paid', paid_at=?, tx_hash=? WHERE task_id=?",
-                           (_now(), hit["tx_hash"], task_id))
+        with db_conn() as db:
+            # --- 分支1: 付款提交 -> 验证 -> 交付 ---
+            if meta.get("x402.payment.status") == "payment-submitted":
+                payload = meta.get("x402.payment.payload") or {}
+                pid = payload.get("paymentId", "")
+                row = db.execute(
+                    "SELECT * FROM orders WHERE task_id=? OR payment_id=?",
+                    (client_task_id or "", pid)).fetchone()
+                if not row:
+                    self._send(200, _rpc_error(rid, -32001, "unknown payment id"))
+                    return
+
+                if row["status"] == "paid" and row["artifact"]:
+                    if row["delivered_count"] >= MAX_DELIVER:
+                        self._send(200, _rpc_error(rid, -32002, "delivery limit reached"))
+                        return
+                    db.execute("UPDATE orders SET delivered_count=delivered_count+1 WHERE task_id=?",
+                               (row["task_id"],))
+                    db.commit()
+                    self._send(200, _rpc_result(rid, _completed(
+                        row["task_id"], row["artifact"],
+                        {"success": True, "transaction": row["tx_hash"], "network": "tron-mainnet"})))
+                    return
+
+                if row["status"] in ("paid", "paid_undelivered"):
+                    # 已付款但未交付：尝试补发
+                    try:
+                        brief = gen_intel_brief()
+                    except BriefUnavailable as e:
+                        self._send(200, _rpc_result(rid, _working(row["task_id"], str(e))))
+                        return
+                    db.execute("UPDATE orders SET status='paid', artifact=?, paid_at=COALESCE(paid_at, ?) "
+                               "WHERE task_id=? AND tx_hash IS NOT NULL",
+                               (brief, _now_str(), row["task_id"]))
+                    db.commit()
+                    self._send(200, _rpc_result(rid, _completed(
+                        row["task_id"], brief,
+                        {"success": True, "transaction": row["tx_hash"], "network": "tron-mainnet"})))
+                    return
+
+                hit = check_payment(db, row)
+                if not hit:
+                    self._send(200, _rpc_result(rid, _working(
+                        row["task_id"], "尚未检测到付款，请转账后重试。")))
+                    return
+
+                # 原子认领：条件更新，rowcount==0 说明被并发抢先
+                cur = db.execute(
+                    "UPDATE orders SET status='paid', paid_at=?, tx_hash=? "
+                    "WHERE task_id=? AND status='pending'",
+                    (_now_str(), hit["tx_hash"], row["task_id"]))
+                if cur.rowcount == 0:
+                    db.rollback()
+                    self._send(200, _rpc_error(rid, -32003, "payment already claimed"))
+                    return
+                # 生成并固化交付物；失败则记为 paid_undelivered，不返回占位
+                try:
+                    brief = gen_intel_brief()
+                except BriefUnavailable as e:
+                    db.execute("UPDATE orders SET status='paid_undelivered' WHERE task_id=?",
+                               (row["task_id"],))
+                    db.commit()
+                    self._send(200, _rpc_result(rid, _working(
+                        row["task_id"],
+                        f"付款已确认（tx {hit['tx_hash'][:12]}…），但内容源暂不可用：{e}。"
+                        f"系统将补发；如需退款请回传 refundAddress。")))
+                    return
+                db.execute("UPDATE orders SET artifact=? WHERE task_id=?", (brief, row["task_id"]))
                 db.commit()
-                brief = gen_intel_brief()
-                self._send(200, _completed(task_id, brief,
-                    {"success": True, "transaction": hit["tx_hash"], "network": "tron-mainnet"}))
-            else:
-                self._send(200, {
-                    "kind": "task", "id": task_id, "status": {
-                        "state": "working",
-                        "message": {"kind": "message", "role": "agent",
-                                    "parts": [{"kind": "text", "text": "尚未检测到付款，请转账后重试。"}],
-                                    "metadata": {"x402.payment.status": "payment-submitted"}}}})
-            return
+                self._send(200, _rpc_result(rid, _completed(
+                    row["task_id"], brief,
+                    {"success": True, "transaction": hit["tx_hash"], "network": "tron-mainnet"})))
+                return
 
-        # --- 分支2: 新请求 -> 返回付款要求 ---
-        tail = gen_tail()
-        payment_id = f"pay-{os.urandom(6).hex()}"
-        amount = round(PRICE_USD + tail, 2)
-        db.execute("INSERT INTO orders (task_id, payment_id, tail, amount, status, created_at) "
-                   "VALUES (?,?,?,?,?,?)",
-                   (task_id, payment_id, str(tail), amount, "pending", _now()))
-        db.commit()
-        self._send(200, _payment_required(task_id, payment_id, tail))
+            # --- 分支2: 新请求 -> 幂等 -> 返回付款要求 ---
+            # 幂等：若客户端带 taskId 且订单存在，返回同一张单
+            if client_task_id:
+                existing = db.execute("SELECT * FROM orders WHERE task_id=?",
+                                      (client_task_id,)).fetchone()
+                if existing:
+                    if existing["status"] == "pending" and existing["expires_at_ms"] > _now_ms():
+                        self._send(200, _rpc_result(rid, _payment_required(
+                            existing["task_id"], existing["payment_id"], existing["amount_cents"])))
+                        return
+                    if existing["status"] in ("paid",) and existing["artifact"]:
+                        self._send(200, _rpc_result(rid, _completed(
+                            existing["task_id"], existing["artifact"],
+                            {"success": True, "transaction": existing["tx_hash"],
+                             "network": "tron-mainnet"})))
+                        return
+
+            tail_c = gen_tail(db)
+            if tail_c is None:
+                self._send(503, _rpc_error(rid, -32004, "payment slots exhausted, retry in 15 min"))
+                return
+
+            task_id = f"task-{secrets.token_urlsafe(24)}"
+            payment_id = f"pay-{secrets.token_urlsafe(24)}"
+            amount_cents = PRICE_CENTS + tail_c
+            now_ms = _now_ms()
+            db.execute(
+                "INSERT INTO orders (task_id, payment_id, tail_cents, amount_cents, status, "
+                "created_at_ms, expires_at_ms) VALUES (?,?,?,?,?,?,?)",
+                (task_id, payment_id, tail_c, amount_cents, "pending",
+                 now_ms, now_ms + PAYMENT_WINDOW * 1000))
+            db.commit()
+            self._send(200, _rpc_result(rid, _payment_required(task_id, payment_id, amount_cents)))
+
+
+def _now_str():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def main():
+    init_db()
     srv = ThreadingHTTPServer(LISTEN, Handler)
-    print(f"[A2A] 服务启动 http://{LISTEN[0]}:{LISTEN[1]}")
+    log.info("A2A 服务启动 http://%s:%s", LISTEN[0], LISTEN[1])
     srv.serve_forever()
 
 

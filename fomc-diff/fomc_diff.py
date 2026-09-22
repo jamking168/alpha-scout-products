@@ -81,19 +81,20 @@ def http_get(url, ua=UA_WEB, timeout=30):
 # ----------------------------------------------------------------------------
 
 def load_fred_key(path):
-    """从 .env 读 FRED_API_KEY,返回字符串;找不到返回 None。"""
-    if not os.path.isfile(path):
-        return None
-    key = None
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            if k.strip() == "FRED_API_KEY":
-                key = v.strip().strip('"').strip("'")
-    return key or os.environ.get("FRED_API_KEY")
+    """从 .env 读 FRED_API_KEY,找不到则回退环境变量;都没有返回 None。"""
+    if os.path.isfile(path):
+        key = None
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == "FRED_API_KEY" and v.strip():
+                    key = v.strip().strip('"').strip("'")
+        if key:
+            return key
+    return os.environ.get("FRED_API_KEY") or None
 
 
 # ----------------------------------------------------------------------------
@@ -344,12 +345,14 @@ def render_cn(meeting, prev, fred, stmt, sep, fw, out_path):
     L.append(f"FOMC 决议即时 diff 告警 | 决议日 {meeting} (对照 {prev})")
     L.append("=" * 72)
 
-    L.append("\n【1】联邦基金目标利率区间 (FRED, A级)")
+    L.append("\n【1】联邦基金目标利率区间 (FRED 观测, 非本次会议专属)")
     if fred["current"]:
         arrow = "↑" if (fred["bp"] or 0) > 0 else ("↓" if (fred["bp"] or 0) < 0 else "→")
-        L.append(f"  前值: {fred['previous']}%")
-        L.append(f"  现值: {fred['current']}%  ({arrow} {fred['bp']}bp)")
-        L.append(f"  生效日期: {fred['change_date']}")
+        L.append(f"  最近观测: {fred['current']}%")
+        L.append(f"  上次观测: {fred['previous']}%  ({arrow} {fred['bp']}bp)")
+        L.append(f"  变化生效日: {fred['change_date']}")
+        if fred["change_date"] and fred["change_date"] != meeting:
+            L.append(f"  ⚠️ 变化生效日({fred['change_date']})≠本次会议日({meeting}),本次会议可能未调整利率,需以声明为准")
     else:
         L.append("  获取失败")
 
@@ -371,7 +374,7 @@ def render_cn(meeting, prev, fred, stmt, sep, fw, out_path):
     else:
         L.append("  声明获取失败")
 
-    L.append("\n【3】点阵图中位数 (SEP, A级)")
+    L.append("\n【3】点阵图中位数 (SEP, 解析待核验)")
     if sep:
         L.append(f"  数据: {sep['url']}")
         yrs = sep["years"]
@@ -379,6 +382,7 @@ def render_cn(meeting, prev, fred, stmt, sep, fw, out_path):
         jun = sep["june"]
         L.append("  年        | 本次中位数 | 上次(June) | 变动")
         L.append("  ----------|------------|------------|------")
+        L.append("  (注: 表头/行列定位依赖页面结构,数值需人工核对,不可直接作为交易依据)")
         for i, y in enumerate(yrs):
             m = med[i] if i < len(med) else "-"
             j = jun[i] if i < len(jun) and jun[i] else "-"
