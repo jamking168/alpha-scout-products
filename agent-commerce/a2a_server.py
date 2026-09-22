@@ -21,21 +21,25 @@ v2 修复（对应审查报告 P0）:
 - P1    SQLite WAL + busy_timeout + 连接治理
 """
 import datetime
+import ipaddress
 import json
 import logging
 import os
 import secrets
 import sqlite3
+import threading
 import time
 import urllib.request
 from contextlib import contextmanager
 
 from hd_wallet import derive_address, load_mnemonic, verify_wallet
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import ThreadingMixIn
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CARD_PATH = os.path.join(BASE, "agent-card.json")
 STATE_DIR = os.path.join(BASE, "state")
+HWM_PATH = os.path.join(STATE_DIR, "hd_index.hwm")  # HD 高水位独立文件(DB 被删/重建也不回退, 防地址复用)
 DB_PATH = os.path.join(STATE_DIR, "a2a_orders.db")
 
 RECEIVE_ADDRESS = "TLnnmqLiY4CE8bnekow6ikpjDHoytJP5p3"  # 归集主地址(子地址收到的 USDT 最终归集到这里)
@@ -48,7 +52,7 @@ PRICE_CENTS = 500          # $5.00 = 500 分(独立地址下无尾数, 固定金
 # master mnemonic 从环境变量 TRON_MASTER_MNEMONIC 读取(私钥级, 不落盘, 开单时懒加载)。
 PAYMENT_WINDOW = 3600        # 付款窗口 60 分钟(TRON 出块 3s,手动转账+交易所提币常超时,15 分钟太紧)
 MAX_BODY = 64 * 1024        # 请求体上限 64 KiB
-MAX_DELIVER = 3             # 单订单交付次数上限
+MAX_DELIVER = 5             # 单订单交付次数硬上限(含网络重试余量; 防 task_id 泄露无限白嫖)
 RATE_LIMIT = 5              # 每 IP 每窗口请求数
 RATE_WINDOW = 60            # 限流窗口秒
 NEW_ORDER_LIMIT = 3         # 每 IP 每窗口「创建订单」配额(与通用 RPC 限流解耦)
@@ -133,11 +137,34 @@ def init_db():
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_addr_unique ON orders(receive_address)")
         # 旧架构迁移: 无独立地址的旧 pending 订单作废(旧共享地址+尾数架构已废弃)
         c.execute("UPDATE orders SET status='expired' WHERE receive_address IS NULL AND status='pending'")
-        # hd_counter 初始化 + 对齐到 MAX(address_index)+1(单调递增, 删行/清理不回退)
+        # hd_counter 初始化 + 对齐到 MAX(address_index)+1 与独立高水位文件的 max(单调递增, 删行/清理/DB重建都不回退)
         c.execute("INSERT OR IGNORE INTO hd_counter (id, next_index) VALUES (1, 1)")
         mx = c.execute("SELECT COALESCE(MAX(address_index), 0) FROM orders").fetchone()[0]
-        c.execute("UPDATE hd_counter SET next_index = MAX(next_index, ?) WHERE id = 1", (mx + 1,))
+        floor = max(mx + 1, _read_hwm() + 1, 1)
+        c.execute("UPDATE hd_counter SET next_index = MAX(next_index, ?) WHERE id = 1", (floor,))
         c.commit()
+
+
+def _read_hwm() -> int:
+    """读 HD 高水位(独立文件, DB 删除/重建也不回退)。"""
+    try:
+        with open(HWM_PATH) as f:
+            return int(f.read().strip() or 0)
+    except Exception:
+        return 0
+
+
+def _bump_hwm(idx: int) -> None:
+    """单调水位线落独立文件: 宁可跳号, 不可复用地址。commit 前调用。"""
+    if idx <= _read_hwm():
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = HWM_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(idx))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, HWM_PATH)
 
 
 def _now_ms() -> int:
@@ -196,7 +223,10 @@ def fetch_incoming_since(address: str, min_ts_ms: int, max_ts_ms: int | None = N
 
 
 def check_payment(db, order) -> dict | None:
-    """查订单专属地址的入账: 每地址只服务一个订单, 无需尾数匹配/tx 去重, 精确金额验证即可。"""
+    """查订单专属地址的入账: 每地址只服务一个订单, 无需尾数匹配/tx 去重。
+
+    足额或多付(>=)即认领(交易所提币常扣 1 USDT 手续费, 精确匹配会导致"收了钱不给货")。
+    少付返回 short 提示差额。"""
     receive_addr = order["receive_address"]
     target_cents = order["amount_cents"]
     created_ms = order["created_at_ms"]
@@ -205,6 +235,8 @@ def check_payment(db, order) -> dict | None:
     except Exception as e:
         log.warning("trongrid 查询失败: %s", e)
         return None
+    expected_raw = target_cents * 10000
+    best_short = None          # 记录最大的「不足额」入账, 用于告知用户差额
     for tx in txs:
         txid = tx.get("transaction_id", "")
         if not txid:
@@ -232,11 +264,17 @@ def check_payment(db, order) -> dict | None:
         # 固定 USDT 精度为 6(不依赖上游 metadata 决定指数运算)
         if dec != 6:
             continue
-        # 精确 raw 比较(不整除截断,杜绝少付 0.000001 也通过)
-        expected_raw = target_cents * 10000
-        if raw != expected_raw:
-            continue
-        return {"tx_hash": txid, "amount_cents": target_cents, "blk_ms": blk_ms}
+        # 足额或多付 -> 认领(多付部分记录, 人工退差/记 credit)
+        if raw >= expected_raw:
+            return {"tx_hash": txid, "amount_cents": target_cents,
+                    "paid_raw": raw, "overpaid_raw": raw - expected_raw,
+                    "blk_ms": blk_ms}
+        # 不足额 -> 记录最大一笔, 供提示补差
+        if best_short is None or raw > best_short[1]:
+            best_short = (txid, raw)
+    if best_short:
+        return {"short": True, "tx_hash": best_short[0], "paid_raw": best_short[1],
+                "expected_raw": expected_raw}
     return None
 
 
@@ -262,7 +300,10 @@ def _payment_required(task_id: str, payment_id: str, amount_cents: int, receive_
                 "parts": [{
                     "kind": "text",
                     "text": (f"解锁「每日情报简报」需支付 {amount_usd:.2f} USDT (TRC-20) 到 "
-                             f"{receive_address}。付款后回传 paymentId 即可获取简报。")
+                             f"{receive_address}。\n"
+                             f"⚠️ 若从交易所提币，请把提币数量设为能让到账 ≥ {amount_usd:.2f} USDT 的值"
+                             f"（多数交易所 TRC20 提币扣 1 USDT 手续费，即需提 {amount_usd + 1:.2f}）。\n"
+                             f"付款后回传 paymentId 即可获取简报。")
                 }],
                 "metadata": {
                     "x402.payment.status": "payment-required",
@@ -281,7 +322,7 @@ def _payment_required(task_id: str, payment_id: str, amount_cents: int, receive_
                                 "amountCents": str(amount_cents),
                                 "amountUsd": f"{amount_usd:.2f}",
                                 "exactAmountRaw": raw,
-                                "note": "本地址为订单专属收款地址, 请按 exactAmountRaw 精确支付;maxAmountRequired 即本订单精确金额"
+                                "note": "本地址为订单专属收款地址; 按到账金额 ≥ exactAmountRaw 支付即可(多付部分留人工退差/记 credit)"
                             }
                         }]
                     }
@@ -386,6 +427,7 @@ class Handler(BaseHTTPRequestHandler):
                     return parts[-1]
         return peer
 
+
     def do_GET(self):
         if self.path.rstrip("/") == "/.well-known/agent-card.json":
             if not os.path.exists(CARD_PATH):
@@ -398,7 +440,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        ip = self._client_ip()
+        ip = _ip_key(self._client_ip())
         if not _allow(ip):
             self._send(429, _rpc_error(None, -32005, "rate limited"))
             return
@@ -476,7 +518,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 if row["status"] == "paid" and row["artifact"]:
-                    # 已固化内容: 幂等重取(不设终身三次硬上限,防止网络重试被永久锁死)
+                    # 已固化内容: 幂等重取, 但设硬上限(payment_id 虽是 secret, 防 task_id 泄露路径的无限白嫖)
+                    if (row["delivered_count"] or 0) >= MAX_DELIVER:
+                        self._send(200, _rpc_error(rid, -32010, "delivery limit reached; contact support"))
+                        return
                     db.execute("UPDATE orders SET delivered_count=delivered_count+1 WHERE task_id=?",
                                (row["task_id"],))
                     db.commit()
@@ -538,6 +583,22 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, _rpc_result(rid, _working(
                         row["task_id"], "尚未检测到付款，请转账后重试。")))
                     return
+
+                # 少付: 明确告知差额(交易所提币常扣手续费), 不认领, 给补差或退款指引
+                if hit.get("short"):
+                    shortfall = (hit["expected_raw"] - hit["paid_raw"]) / 1e6
+                    self._send(200, _rpc_result(rid, _working(
+                        row["task_id"],
+                        f"已检测到入账 {hit['paid_raw']/1e6:.6f} USDT, 少于订单金额 "
+                        f"{hit['expected_raw']/1e6:.2f} USDT（差 {shortfall:.6f}）。"
+                        f"注意：交易所提币通常扣 1 USDT 手续费，请按到账金额补足差额到同一地址 "
+                        f"{row['receive_address']}，或回传 refundAddress 申请退款。")))
+                    return
+
+                # 多付: 记录告警(不自动退回, 留人工退差/记 credit)
+                if hit.get("overpaid_raw", 0) > 0:
+                    log.warning("OVERPAY task=%s tx=%s overpaid_raw=%s",
+                                row["task_id"], hit["tx_hash"], hit["overpaid_raw"])
 
                 # 原子认领: BEGIN IMMEDIATE 写锁内复查 tx_hash 未被占用 + 条件更新
                 try:
@@ -624,7 +685,20 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(200, _rpc_error(rid, -32007, "order refunded"))
                         return
                     if st in ("paid", "paid_undelivered", "refund_requested"):
-                        # 已付款: 允许凭 task_id 取货(不回传 payment_id)
+                        # task_id 不是 secret(会进 A2A trace/日志/relay)。凭 task_id 取货必须附付款 tx_hash 证明。
+                        proof = meta.get("x402.payment.txHash") or (
+                            (meta.get("x402.payment.payload") or {}).get("txHash")
+                            if isinstance(meta.get("x402.payment.payload"), dict) else None)
+                        if not isinstance(proof, str) or not existing["tx_hash"] or \
+                                proof.strip().lower() != existing["tx_hash"].lower():
+                            self._send(200, _rpc_error(rid, -32009,
+                                "resubmit with your paymentId, or provide x402.payment.txHash as proof of payment"))
+                            return
+                        if (existing["delivered_count"] or 0) >= MAX_DELIVER:
+                            self._send(200, _rpc_error(rid, -32010,
+                                "delivery limit reached; contact support"))
+                            return
+                        # 已付款: 凭 tx_hash 证明取货(不回传 payment_id)
                         if existing["artifact"]:
                             db.execute("UPDATE orders SET delivered_count=delivered_count+1 WHERE task_id=?",
                                        (client_task_id,))
@@ -711,6 +785,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(503, _rpc_error(rid, -32004, "payment unavailable, retry later"))
                     return
                 db.execute("UPDATE hd_counter SET next_index = ? WHERE id = 1", (next_idx + 1,))
+                _bump_hwm(next_idx)   # commit 前落独立水位线(宁可跳号, 不可复用)
                 receive_addr = derive_address(mnemonic, next_idx)
                 task_id = f"task-{secrets.token_urlsafe(24)}"
                 payment_id = f"pay-{secrets.token_urlsafe(24)}"
@@ -733,10 +808,48 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, _rpc_result(rid, _payment_required(task_id, payment_id, amount_cents, receive_addr)))
 
 
+def _ip_key(ip: str) -> str:
+    """限流键: IPv6 归一到 /64(防 /64 子网刷单绕过), IPv4 保持原样。"""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if a.version == 6:
+        return str(ipaddress.ip_network(f"{a}/64", strict=False).network_address) + "/64"
+    return str(a)
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """带并发线程上限的 HTTP 服务: 防慢 TronGrid 查询(8s 超时)占满线程导致内存打爆。
+
+    注意: 只继承 ThreadingHTTPServer(它已含 ThreadingMixIn), 再加 ThreadingMixIn 会 MRO 冲突。"""
+    daemon_threads = True
+    _sem = threading.BoundedSemaphore(32)  # 并发上限 32
+
+    def process_request(self, request, client_address):
+        if not self._sem.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+            except Exception:
+                pass
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            try:
+                self._sem.release()
+            except ValueError:
+                pass
+
+
 def main():
     init_db()
     verify_wallet(RECEIVE_ADDRESS)  # index0 自检: 助记词错误拒绝启动, 防止收款到不可控地址
-    srv = ThreadingHTTPServer(LISTEN, Handler)
+    srv = BoundedThreadingHTTPServer(LISTEN, Handler)
     log.info("A2A 服务启动 http://%s:%s", LISTEN[0], LISTEN[1])
     srv.serve_forever()
 

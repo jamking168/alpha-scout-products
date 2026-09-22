@@ -41,10 +41,12 @@ from a2a_server import (  # noqa: E402
 
 LOG_PATH = os.path.join(STATE_DIR, "sweep.log")
 LOCK_PATH = os.path.join(STATE_DIR, "sweep.lock")
-FEE_LIMIT_SUN = 30_000_000       # 30 TRX 烧 TRX 上限(能量不足时兜底)
-TRX_FUND_SUN = 15_000_000        # 充值目标(激活 + 烧能量, TRC20 转账约 13.3 TRX)
-TRX_FUND_MIN_DEFICIT = 1_000_000  # 差额 < 1 TRX 不补(避免碎片充值)
-MIN_SWEEP_RAW = 50_000_000        # 归集阈值 $50: 低于此不归集, 等积累摊薄 13 TRX 成本
+FEE_LIMIT_SUN = 8_000_000        # 8 TRX 烧 TRX 上限(实际约 3.2 TRX + 波动余量, 原 30 TRX 过宽)
+TRX_FUND_SUN = 5_000_000         # 充值目标 5 TRX: 3.2 TRX 转账 + 1.8 TRX 余量(原 15 TRX 会沉没 11.8 TRX/单)
+TRX_FUND_MIN_DEFICIT = 500_000   # 差额 < 0.5 TRX 不补(避免碎片充值)
+MIN_SWEEP_RAW = 4_500_000        # 归集阈值 $4.5: 每地址只收一张 $5 订单, 单笔即归集(原 $50 会让归集从不发生)
+TRX_DUST_SUN = 1_500_000         # 归集后子地址残余 TRX > 1.5 则回收(留 1.1 TRX 覆盖回收转账成本)
+MAIN_TRX_FLOOR_SUN = 50_000_000  # 主地址 TRX 低于 50 则停止充值(防主地址 TRX 漏光)
 
 
 def log(msg: str) -> None:
@@ -81,10 +83,12 @@ def ensure_schema(db) -> None:
 
 
 def pending_orders(db):
-    """扫所有收到钱但未归集的订单(含 paid_undelivered / refund_requested, 这些地址上也有真金白银)。"""
+    """扫所有收到钱但未归集的订单(含 paid_undelivered / refund_requested, 这些地址上也有真金白银)。
+
+    含 NO_BALANCE 复查: 余额 0 标记过的地址, 后续可能又收到钱(重复付款/延迟到账), 必须复查。"""
     return db.execute(
-        "SELECT * FROM orders WHERE tx_hash IS NOT NULL AND COALESCE(swept, 0) = 0 "
-        "AND receive_address IS NOT NULL"
+        "SELECT * FROM orders WHERE tx_hash IS NOT NULL AND receive_address IS NOT NULL "
+        "AND (COALESCE(swept, 0) = 0 OR sweep_tx = 'NO_BALANCE')"
     ).fetchall()
 
 
@@ -189,9 +193,10 @@ def main() -> None:
                 log(f"SKIP {tid}… USDT 余额查询失败(429/超时), 保留待重试")
                 continue
             if bal <= 0:
-                log(f"SKIP {tid}… 余额 0, 标记 swept")
+                # 余额 0 不标 swept(可能是延迟到账), 标 NO_BALANCE + sweep_at 作上次检查时间, 保留复查
+                log(f"SKIP {tid}… 余额 0(保留复查, 地址可能后续到账)")
                 db.execute(
-                    "UPDATE orders SET swept=1, sweep_tx='NO_BALANCE', sweep_at=? WHERE task_id=?",
+                    "UPDATE orders SET sweep_tx='NO_BALANCE', sweep_at=? WHERE task_id=?",
                     (_now_str(), order["task_id"]),
                 )
                 db.commit()
@@ -213,6 +218,15 @@ def main() -> None:
                 continue
             # 4. 充值(差额, 广播后先记 fund_tx 再验回执, 防崩溃重跑重复充值)
             if need_fund:
+                # 充值前校验主地址余额: 主地址 TRX 不足则停止本轮充值(防主地址 TRX 漏光)
+                main_trx = get_trx_balance(client, RECEIVE_ADDRESS)
+                if main_trx is None:
+                    log(f"SKIP {tid}… 主地址 TRX 查询失败, 保留待重试")
+                    continue
+                if main_trx - deficit < MAIN_TRX_FLOOR_SUN:
+                    log(f"HALT {tid}… 主地址 TRX {main_trx/1e6:.1f} 不足(下限 {MAIN_TRX_FLOOR_SUN/1e6:.0f}), "
+                        f"停止本轮充值, 请人工补 TRX")
+                    break  # 主地址没钱了, 后续订单也充不了, 直接停(不是 continue)
                 try:
                     fund_txn = build_trx_transfer(client, RECEIVE_ADDRESS, main_priv, from_addr, deficit)
                     fr = fund_txn.broadcast()
@@ -244,6 +258,16 @@ def main() -> None:
                 )
                 db.commit()
                 log(f"SWEPT {tid}… tx={txid} amount={bal / 1e6:.2f}")
+                # 回收残余 TRX(留 1.1 TRX 覆盖这笔 TRX 转账本身的带宽/激活成本, 防沉没)
+                rest = get_trx_balance(client, from_addr)
+                if rest is not None and rest > TRX_DUST_SUN:
+                    try:
+                        back = rest - 1_100_000
+                        bt = build_trx_transfer(client, from_addr, priv, RECEIVE_ADDRESS, back)
+                        br = bt.broadcast()
+                        log(f"TRX-RECLAIM {tid}… tx={br.get('txid')} amount={back / 1e6:.2f}")
+                    except Exception as e:
+                        log(f"TRX-RECLAIM FAIL {tid}…: {e}")  # 非致命, 下轮再试
             else:
                 log(f"SWEEP REVERT {tid}… tx={txid} receipt={receipt}, 保留待人工核查")
 

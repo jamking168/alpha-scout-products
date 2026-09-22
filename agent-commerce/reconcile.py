@@ -87,7 +87,7 @@ def main() -> None:
                 continue
             if dec != 6:
                 continue
-            if raw == target_raw:
+            if raw >= target_raw:
                 found = txid
                 break
             wrong = (txid, raw, tx.get("from", ""))
@@ -107,8 +107,8 @@ def main() -> None:
                 log(f"ALERT: {tid}… tx {found[:12]}… 已被其他订单认领, 人工核查!")
         elif wrong:
             log(
-                f"AMOUNT-MISMATCH: {tid}… addr={addr} tx {wrong[0][:12]}… "
-                f"raw={wrong[1]} (期望 {target_raw}) from {wrong[2]}"
+                f"AMOUNT-MISMATCH(少付): {tid}… addr={addr} tx {wrong[0][:12]}… "
+                f"raw={wrong[1]} (期望 ≥ {target_raw}) from {wrong[2]}"
             )
     db.close()
 
