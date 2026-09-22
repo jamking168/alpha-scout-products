@@ -150,7 +150,15 @@ def range_delta(upper_obs, lower_obs):
         except (TypeError, ValueError):
             return None
 
-    bp = to_bp(cur_u, prev_u) or to_bp(cur_l, prev_l)
+    bp_u = to_bp(cur_u, prev_u)
+    bp_l = to_bp(cur_l, prev_l)
+    if bp_u is None and bp_l is None:
+        bp = None
+    elif bp_u is not None and bp_l is not None and bp_u != bp_l:
+        # 上下限变化不一致 => 区间宽度变化,非平行移动,不能用单一 bp 表达
+        bp = None
+    else:
+        bp = bp_u if bp_u is not None else bp_l
 
     return {
         "current": f"{cur_l}-{cur_u}",
@@ -334,11 +342,37 @@ def _clean(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _validate_sep(years, frow):
+    """校验 SEP 解析结果;通过返回 True,否则 False(宁可不输出,不输出错数字)。"""
+    import re
+    if not years or len(years) < 5:
+        return False
+    if not all(re.match(r"^\d{4}$", str(y).strip()) for y in years[:4]):
+        return False
+    if "longer" not in str(years[4]).lower():
+        return False
+    vals = frow[1:6] if len(frow) >= 6 else []
+    if len(vals) < 5:
+        return False
+    for v in vals:
+        s = str(v).strip().replace("%", "")
+        if not re.match(r"^\d(\.\d{1,2})?$", s):
+            return False
+        try:
+            f = float(s)
+        except ValueError:
+            return False
+        if not (0.0 <= f <= 10.0):
+            return False
+    return True
+
+
 def fetch_sep_median(date_str):
     """抓取并解析 SEP 表,返回联邦基金利率中位数行(含 June 对照)。
 
     返回 {"years": [...], "median": {...}, "june": {...}, "url": ...}
     年列为 2026/2027/2028/2029/Longer run;median 行第 2~6 个数字单元格。
+    解析未通过校验时返回 parse_status="unverified" 且数值置 None。
     """
     d = date_str.replace("-", "")
     url = f"{FED_SEP_BASE}/fomcprojtabl{d}.htm"
@@ -361,8 +395,21 @@ def fetch_sep_median(date_str):
         if funds_idx is not None and years is not None:
             frow = rows[funds_idx]
             june_row = rows[funds_idx + 1] if funds_idx + 1 < len(rows) else None
+            # june 行第 0 列必须含月份名,否则视为非 June 对照行置 None
+            if june_row is not None:
+                first = str(june_row[0]).strip().lower() if june_row else ""
+                if not any(m in first for m in ("june", "jun", "sep", "dec", "mar", "march", "year", "month")):
+                    june_row = None
+            if not _validate_sep(years, frow):
+                return {
+                    "url": url,
+                    "parse_status": "unverified",
+                    "years": None, "median": None, "june": None,
+                    "note": "SEP 表结构未通过校验,本次不输出数值(宁可不输出,不输出错数字)",
+                }
             return {
                 "url": url,
+                "parse_status": "verified",
                 "years": years,
                 "median": frow[1:6],
                 "june": june_row[1:6] if june_row else [],
@@ -404,7 +451,9 @@ def render_cn(meeting, prev, fred, stmt, sep, fw, out_path):
         L.append("  获取失败")
 
     L.append("\n【2】决议声明措辞变化 (美联储官网 statement diff)")
-    if stmt["new_text"]:
+    if stmt.get("status") == "incomplete":
+        L.append("  ⚠️ 声明不完整(前次或本次声明获取失败),本次不输出 diff")
+    elif stmt["new_text"]:
         L.append(f"  本次声明: {stmt['new_url']}")
         L.append(f"  前次声明: {stmt['old_url']}")
         added, removed = stmt["added"], stmt["removed"]
@@ -424,22 +473,25 @@ def render_cn(meeting, prev, fred, stmt, sep, fw, out_path):
     L.append("\n【3】点阵图中位数 (SEP, 解析待核验)")
     if sep:
         L.append(f"  数据: {sep['url']}")
-        yrs = sep["years"]
-        med = sep["median"]
-        jun = sep["june"]
-        L.append("  年        | 本次中位数 | 上次(June) | 变动")
-        L.append("  ----------|------------|------------|------")
-        L.append("  (注: 表头/行列定位依赖页面结构,数值需人工核对,不可直接作为交易依据)")
-        for i, y in enumerate(yrs):
-            m = med[i] if i < len(med) else "-"
-            j = jun[i] if i < len(jun) and jun[i] else "-"
-            delta = ""
-            try:
-                if m not in ("", "-") and j not in ("", "-"):
-                    delta = f"{round((float(m) - float(j)) * 100, 0):+.0f}bp"
-            except ValueError:
-                delta = "?"
-            L.append(f"  {y:<10}| {m:<11}| {j:<11}| {delta}")
+        if sep.get("parse_status") == "unverified":
+            L.append(f"  ⚠️ 解析未通过校验,本次不输出点阵图数值: {sep.get('note', '')}")
+        else:
+            yrs = sep["years"] or []
+            med = sep["median"] or []
+            jun = sep["june"] or []
+            L.append("  年        | 本次中位数 | 上次(June) | 变动")
+            L.append("  ----------|------------|------------|------")
+            L.append("  (注: 表头/行列定位依赖页面结构,数值需人工核对,不可直接作为交易依据)")
+            for i, y in enumerate(yrs):
+                m = med[i] if i < len(med) else "-"
+                j = jun[i] if i < len(jun) and jun[i] else "-"
+                delta = ""
+                try:
+                    if m not in ("", "-") and j not in ("", "-"):
+                        delta = f"{round((float(m) - float(j)) * 100, 0):+.0f}bp"
+                except ValueError:
+                    delta = "?"
+                L.append(f"  {y:<10}| {m:<11}| {j:<11}| {delta}")
     else:
         L.append("  点阵图获取失败")
 
@@ -494,13 +546,19 @@ def main():
     else:
         print("警告: 未找到 FRED_API_KEY,跳过 FRED 利率区间抓取", file=sys.stderr)
 
-    # 声明
+    # 声明: 缺任一份则不生成 diff,标记 incomplete(不输出错误信号)
     new_url, new_text = fetch_statement(meeting)
     old_url, old_text = (None, None)
     if prev:
         old_url, old_text = fetch_statement(prev)
-    added, removed = sentence_diff(old_text or "", new_text or "")
+    if new_text and old_text:
+        added, removed = sentence_diff(old_text, new_text)
+        stmt_status = "complete"
+    else:
+        added, removed = None, None
+        stmt_status = "incomplete"
     stmt = {"new_url": new_url, "old_url": old_url, "new_text": new_text,
+            "old_text": old_text, "status": stmt_status,
             "added": added, "removed": removed}
 
     # SEP
@@ -509,20 +567,25 @@ def main():
     # FedWatch
     fw = None if args.no_fedwatch else fetch_fedwatch()
 
-    # 输出
+    # 输出(原子写入: 临时文件 + os.replace)
     os.makedirs(args.out_dir, exist_ok=True)
     out_path = os.path.join(args.out_dir, f"fomc_diff_{meeting}.json")
     payload = {
-        "generated_at_utc": dt.datetime.utcnow().isoformat() + "Z",
+        "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "meeting": meeting, "prev": prev,
         "fed_funds": fred,
         "statement": {"new_url": new_url, "old_url": old_url,
+                      "status": stmt_status,
                       "added": added, "removed": removed},
         "sep": sep,
         "fedwatch": fw,
     }
-    with open(out_path, "w", encoding="utf-8") as f:
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, out_path)
 
     print(render_cn(meeting, prev, fred, stmt, sep, fw, out_path))
 

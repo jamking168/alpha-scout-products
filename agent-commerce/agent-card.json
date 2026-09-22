@@ -40,7 +40,7 @@
     }
   ],
   "x402-payment": {
-    "note": "自拟扩展字段(非 A2A 官方 schema)。x402 参考 facilitator(Coinbase)不含 TRON,此处按 A2A-x402 的 PaymentRequirements 结构自拟 TRON USDT(TRC-20)收款方案,由自建 facilitator 经 TronGrid 验到账(唯一金额尾数匹配)。每笔订单金额动态生成:定价 $5 + 唯一尾数 1-99 分(即 $5.01-$5.99),用于订单标识。",
+    "note": "自拟扩展字段(非 A2A 官方 schema)。x402 参考 facilitator(Coinbase)不含 TRON,此处按 A2A-x402 的 PaymentRequirements 结构自拟 TRON USDT(TRC-20)收款方案,由自建 facilitator 经 TronGrid 验到账(唯一金额尾数匹配)。每笔订单金额动态生成:定价 $5 + 唯一尾数 1-99 分(即 $5.01-$5.99),用于订单标识。maxAmountRequired 仅为范围上限,真实付款金额以运行时 payment-required 响应的 extra.exactAmountRaw/amountUsd 为准,必须精确支付(多付少付均无法匹配)。",
     "accepts": [
       {
         "scheme": "trc20-usdt-exact",
@@ -50,7 +50,7 @@
         "payTo": "TLnnmqLiY4CE8bnekow6ikpjDHoytJP5p3",
         "maxAmountRequired": "5990000",
         "amountUnit": "usdt-6dp",
-        "payment-matching": "unique-decimal-tail (1-99 cents), per-order, 15-min window",
+        "payment-matching": "unique-decimal-tail (1-99 cents), per-order, 60-min window",
         "verify": "TronGrid trc20 transfer polling (only_confirmed, contract_address=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t)"
       }
     ]

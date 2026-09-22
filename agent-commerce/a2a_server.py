@@ -42,7 +42,7 @@ INTEL_DB = "/home/jam/.hermes/profiles/alpha-scout/state/intel_library.db"
 
 PRICE_CENTS = 500          # $5.00 = 500 分
 TAIL_MIN, TAIL_MAX = 1, 99  # 尾数 1–99 分（即 $0.01–$0.99）
-PAYMENT_WINDOW = 900        # 付款窗口 15 分钟
+PAYMENT_WINDOW = 3600        # 付款窗口 60 分钟(TRON 出块 3s,手动转账+交易所提币常超时,15 分钟太紧)
 MAX_BODY = 64 * 1024        # 请求体上限 64 KiB
 MAX_DELIVER = 3             # 单订单交付次数上限
 RATE_LIMIT = 5              # 每 IP 每窗口请求数
@@ -104,11 +104,11 @@ class BriefUnavailable(Exception):
 
 
 def gen_tail(db) -> int | None:
-    """从未过期且未占用的尾数中随机取一个；满则返回 None（触发 503 排队）。"""
+    """从未过期且未占用的尾数中随机取一个；满则返回 None（触发 503 排队）。
+    本函数不 commit，由调用方在事务内控制；先回收过期订单。"""
     now_ms = _now_ms()
     db.execute("UPDATE orders SET status='expired' WHERE status='pending' AND expires_at_ms <= ?",
                (now_ms,))
-    db.commit()
     used = {r[0] for r in db.execute("SELECT tail_cents FROM orders WHERE status='pending'")}
     free = [t for t in range(TAIL_MIN, TAIL_MAX + 1) if t not in used]
     if not free:
@@ -167,22 +167,28 @@ def check_payment(db, order) -> dict | None:
         # 字段在交易顶层，非 token_info
         if tx.get("to") != RECEIVE_ADDRESS:
             continue
-        if tx.get("type") != "Transfer":
+        if tx.get("from") == RECEIVE_ADDRESS:   # 排除自转/退款
+            continue
+        t = tx.get("type")
+        if t is not None and t != "Transfer":   # type 缺失不跳过(部分接口不返回)
             continue
         tok = tx.get("token_info") or {}
         if tok.get("address") != USDT_CONTRACT:
             continue
         blk_ms = int(tx.get("block_timestamp", 0) or 0)
+        # 时间窗: 订单创建后 PAYMENT_WINDOW 内(覆盖正常 + 过期补救)
         if not (created_ms <= blk_ms <= created_ms + PAYMENT_WINDOW * 1000):
             continue
         try:
             dec = int(tok.get("decimals", 6))
-            amt_cents = int(tx.get("value", "0")) * 100 // (10 ** dec)
+            raw = int(tx.get("value", "0"))
         except (ValueError, TypeError):
             continue
-        if amt_cents != target_cents:
+        # 精确 raw 比较(不整除截断,杜绝少付 0.000001 也通过)
+        expected_raw = target_cents * (10 ** dec) // 100
+        if raw != expected_raw:
             continue
-        return {"tx_hash": txid, "amount_cents": amt_cents}
+        return {"tx_hash": txid, "amount_cents": target_cents}
     return None
 
 
@@ -226,7 +232,8 @@ def _payment_required(task_id: str, payment_id: str, amount_cents: int) -> dict:
                                 "paymentId": payment_id,
                                 "amountCents": str(amount_cents),
                                 "amountUsd": f"{amount_usd:.2f}",
-                                "matching": "unique-decimal-tail (1-99 cents)"
+                                "exactAmountRaw": raw,
+                                "note": "必须按 exactAmountRaw/amountUsd 精确支付(多付少付均无法匹配);maxAmountRequired 即本订单精确金额"
                             }
                         }]
                     }
@@ -276,6 +283,9 @@ _RATE = {}
 
 def _allow(ip: str) -> bool:
     now = time.time()
+    # 定期清理,防过期 IP 导致内存无限增长
+    if len(_RATE) > 1000:
+        _RATE.clear()
     q = [t for t in _RATE.get(ip, []) if now - t < RATE_WINDOW]
     if len(q) >= RATE_LIMIT:
         _RATE[ip] = q
@@ -297,6 +307,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log.info("%s %s", self.address_string(), fmt % args)
 
+    def _client_ip(self) -> str:
+        # 服务只绑定 127.0.0.1,仅被本机 Caddy 反代(防火墙不对外开 8898)。
+        # 故 client_address 恒为 127.0.0.1,真实 IP 须从 Caddy 注入的 X-Forwarded-For 取。
+        xff = self.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0]
+
     def do_GET(self):
         if self.path.rstrip("/") == "/.well-known/agent-card.json":
             if not os.path.exists(CARD_PATH):
@@ -309,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        ip = self.client_address[0]
+        ip = self._client_ip()
         if not _allow(ip):
             self._send(429, _rpc_error(None, -32005, "rate limited"))
             return
@@ -355,18 +373,35 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, _rpc_error(rid, -32602, "invalid message"))
             return
         meta = msg.get("metadata") or {}
+        if not isinstance(meta, dict):
+            self._send(200, _rpc_error(rid, -32602, "invalid metadata"))
+            return
         client_task_id = msg.get("taskId")
+        if client_task_id is not None and not isinstance(client_task_id, str):
+            self._send(200, _rpc_error(rid, -32602, "invalid taskId"))
+            return
+        if client_task_id is not None and len(client_task_id) > 128:
+            self._send(200, _rpc_error(rid, -32602, "taskId too long"))
+            return
 
         with db_conn() as db:
             # --- 分支1: 付款提交 -> 验证 -> 交付 ---
             if meta.get("x402.payment.status") == "payment-submitted":
                 payload = meta.get("x402.payment.payload") or {}
+                if not isinstance(payload, dict):
+                    self._send(200, _rpc_error(rid, -32602, "invalid payload"))
+                    return
                 pid = payload.get("paymentId", "")
-                row = db.execute(
-                    "SELECT * FROM orders WHERE task_id=? OR payment_id=?",
-                    (client_task_id or "", pid)).fetchone()
+                if not isinstance(pid, str) or not pid:
+                    self._send(200, _rpc_error(rid, -32602, "invalid paymentId"))
+                    return
+                # 取货凭证 = payment_id(保密); task_id 仅做一致性校验,不再是凭证
+                row = db.execute("SELECT * FROM orders WHERE payment_id=?", (pid,)).fetchone()
                 if not row:
                     self._send(200, _rpc_error(rid, -32001, "unknown payment id"))
+                    return
+                if client_task_id and client_task_id != row["task_id"]:
+                    self._send(200, _rpc_error(rid, -32001, "task/payment mismatch"))
                     return
 
                 if row["status"] == "paid" and row["artifact"]:
@@ -403,20 +438,29 @@ class Handler(BaseHTTPRequestHandler):
                         row["task_id"], "尚未检测到付款，请转账后重试。")))
                     return
 
-                # 原子认领：条件更新，rowcount==0 说明被并发抢先
-                cur = db.execute(
-                    "UPDATE orders SET status='paid', paid_at=?, tx_hash=? "
-                    "WHERE task_id=? AND status='pending'",
-                    (_now_str(), hit["tx_hash"], row["task_id"]))
+                # 原子认领(含过期订单补救): 条件更新,rowcount==0 说明被并发抢先
+                try:
+                    cur = db.execute(
+                        "UPDATE orders SET status='paid', paid_at=?, tx_hash=? "
+                        "WHERE task_id=? AND status IN ('pending','expired')",
+                        (_now_str(), hit["tx_hash"], row["task_id"]))
+                except sqlite3.IntegrityError:
+                    db.rollback()
+                    self._send(200, _rpc_error(rid, -32003, "payment already claimed by another order"))
+                    return
                 if cur.rowcount == 0:
                     db.rollback()
                     self._send(200, _rpc_error(rid, -32003, "payment already claimed"))
                     return
-                # 生成并固化交付物；失败则记为 paid_undelivered，不返回占位
+                # 关键: 认领后立即 commit(先落账,再干活),把认领与交付拆成两个事务
+                db.commit()
+                # 生成并固化交付物；失败则记为 paid_undelivered,不返回占位
                 try:
                     brief = gen_intel_brief()
                 except BriefUnavailable as e:
                     refund_addr = payload.get("refundAddress", "")
+                    if not isinstance(refund_addr, str):
+                        refund_addr = ""
                     if refund_addr:
                         db.execute("UPDATE orders SET status='refund_requested', refund_address=? "
                                    "WHERE task_id=?", (refund_addr, row["task_id"]))
@@ -430,7 +474,8 @@ class Handler(BaseHTTPRequestHandler):
                         msg += f" 已收到退款地址 {refund_addr[:8]}…，退款待人工处理。"
                     self._send(200, _rpc_result(rid, _working(row["task_id"], msg)))
                     return
-                db.execute("UPDATE orders SET artifact=? WHERE task_id=?", (brief, row["task_id"]))
+                db.execute("UPDATE orders SET artifact=?, delivered_count=1 WHERE task_id=?",
+                           (brief, row["task_id"]))
                 db.commit()
                 self._send(200, _rpc_result(rid, _completed(
                     row["task_id"], brief,
@@ -454,21 +499,32 @@ class Handler(BaseHTTPRequestHandler):
                              "network": "tron-mainnet"})))
                         return
 
-            tail_c = gen_tail(db)
-            if tail_c is None:
-                self._send(503, _rpc_error(rid, -32004, "payment slots exhausted, retry in 15 min"))
+            # 原子化: 唯一索引 ix_tail_active 是尾数冲突的最终防线,冲突则重试
+            task_id = payment_id = amount_cents = None
+            for _attempt in range(5):
+                tail_c = gen_tail(db)
+                if tail_c is None:
+                    db.rollback()
+                    self._send(503, _rpc_error(rid, -32004, "payment slots exhausted, retry later"))
+                    return
+                task_id = f"task-{secrets.token_urlsafe(24)}"
+                payment_id = f"pay-{secrets.token_urlsafe(24)}"
+                amount_cents = PRICE_CENTS + tail_c
+                now_ms = _now_ms()
+                try:
+                    db.execute(
+                        "INSERT INTO orders (task_id, payment_id, tail_cents, amount_cents, status, "
+                        "created_at_ms, expires_at_ms) VALUES (?,?,?,?,?,?,?)",
+                        (task_id, payment_id, tail_c, amount_cents, "pending",
+                         now_ms, now_ms + PAYMENT_WINDOW * 1000))
+                    db.commit()
+                    break
+                except sqlite3.IntegrityError:
+                    db.rollback()
+                    continue
+            else:
+                self._send(503, _rpc_error(rid, -32004, "payment slots exhausted, retry later"))
                 return
-
-            task_id = f"task-{secrets.token_urlsafe(24)}"
-            payment_id = f"pay-{secrets.token_urlsafe(24)}"
-            amount_cents = PRICE_CENTS + tail_c
-            now_ms = _now_ms()
-            db.execute(
-                "INSERT INTO orders (task_id, payment_id, tail_cents, amount_cents, status, "
-                "created_at_ms, expires_at_ms) VALUES (?,?,?,?,?,?,?)",
-                (task_id, payment_id, tail_c, amount_cents, "pending",
-                 now_ms, now_ms + PAYMENT_WINDOW * 1000))
-            db.commit()
             self._send(200, _rpc_result(rid, _payment_required(task_id, payment_id, amount_cents)))
 
 
