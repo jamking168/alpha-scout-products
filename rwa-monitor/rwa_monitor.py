@@ -73,14 +73,20 @@ def _get(url, retries=RETRIES):
 
 def _nearest_ts_value(tvl_points, target_ts):
     """在升序 tvl_points 中找 date <= target_ts 的最后一个点的 totalLiquidityUSD。
-    若最早点都比 target 晚(协议刚上线),返回 None 表示无更早基线。"""
+    若最早点都比 target 晚(协议刚上线),返回 None 表示无更早基线。
+    内部先按 date 排序去重,避免乱序/重复数据误导。"""
     if not tvl_points:
         return None
-    dates = [p["date"] for p in tvl_points]
+    # 排序去重(按 date 升序,同 date 保留最后一个)
+    seen = {}
+    for p in tvl_points:
+        seen[p["date"]] = p
+    pts = sorted(seen.values(), key=lambda p: p["date"])
+    dates = [p["date"] for p in pts]
     idx = bisect_right(dates, target_ts) - 1
     if idx < 0:
         return None
-    return tvl_points[idx]["totalLiquidityUSD"]
+    return pts[idx]["totalLiquidityUSD"]
 
 
 def _pct(cur, prev):
@@ -198,8 +204,10 @@ def main():
         flow[f"{w}d_tvl_change_usd"] = round(sum(vals), 2) if vals else None
         flow[f"{w}d_protocols_count"] = len(vals)
 
-    # 覆盖度: 有历史数据的协议当前 TVL 之和 / 板块总量
-    covered_tvl = sum(d["tvl_now"] for d in details if d["tvl_now"] is not None)
+    # 覆盖度: 有有效历史数据的协议当前 TVL 之和 / 板块总量
+    # (排除历史抓取失败的协议,避免虚高覆盖率)
+    covered_tvl = sum(d["tvl_now"] for d in details
+                      if d["tvl_now"] is not None and not d.get("error"))
     coverage = round(covered_tvl / total_tvl * 100, 1) if total_tvl else 0.0
 
     # 涨跌榜
@@ -233,8 +241,12 @@ def main():
 
     fname = time.strftime("snapshot_%Y%m%d_%H%M%S.json", time.gmtime(now))
     out_path = os.path.join(args.outdir, fname)
-    with open(out_path, "w", encoding="utf-8") as f:
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, out_path)
     print(f"[4/4] 快照已写入 {out_path}")
 
     # ---- 中文摘要 ----

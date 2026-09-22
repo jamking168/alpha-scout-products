@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS orders (
     paid_at        TEXT,
     tx_hash        TEXT UNIQUE,
     artifact       TEXT,
-    delivered_count INTEGER DEFAULT 0
+    delivered_count INTEGER DEFAULT 0,
+    refund_address TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_tail_active
     ON orders(tail_cents) WHERE status='pending';
@@ -415,13 +416,19 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     brief = gen_intel_brief()
                 except BriefUnavailable as e:
-                    db.execute("UPDATE orders SET status='paid_undelivered' WHERE task_id=?",
-                               (row["task_id"],))
+                    refund_addr = payload.get("refundAddress", "")
+                    if refund_addr:
+                        db.execute("UPDATE orders SET status='refund_requested', refund_address=? "
+                                   "WHERE task_id=?", (refund_addr, row["task_id"]))
+                    else:
+                        db.execute("UPDATE orders SET status='paid_undelivered' WHERE task_id=?",
+                                   (row["task_id"],))
                     db.commit()
-                    self._send(200, _rpc_result(rid, _working(
-                        row["task_id"],
-                        f"付款已确认（tx {hit['tx_hash'][:12]}…），但内容源暂不可用：{e}。"
-                        f"系统将补发；如需退款请回传 refundAddress。")))
+                    msg = (f"付款已确认（tx {hit['tx_hash'][:12]}…），但内容源暂不可用：{e}。"
+                           f"系统将补发；如需退款请回传 refundAddress。")
+                    if refund_addr:
+                        msg += f" 已收到退款地址 {refund_addr[:8]}…，退款待人工处理。"
+                    self._send(200, _rpc_result(rid, _working(row["task_id"], msg)))
                     return
                 db.execute("UPDATE orders SET artifact=? WHERE task_id=?", (brief, row["task_id"]))
                 db.commit()

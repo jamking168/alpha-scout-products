@@ -171,19 +171,27 @@ class _TextExtract(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.skip = 0
         self.in_article = False
+        self.depth = 0
         self.buf = []
 
     def handle_starttag(self, tag, attrs):
         if tag in self.SKIP:
             self.skip += 1
+        if self.in_article and tag == "div":
+            self.depth += 1
         if tag == "div" and dict(attrs).get("id") == "article":
             self.in_article = True
+            self.depth = 1
         if tag in ("p", "h1", "h2", "h3", "li", "br", "div") and self.in_article:
             self.buf.append("\n")
 
     def handle_endtag(self, tag):
         if tag in self.SKIP and self.skip > 0:
             self.skip -= 1
+        if self.in_article and tag == "div":
+            self.depth -= 1
+            if self.depth == 0:
+                self.in_article = False
 
     def handle_data(self, data):
         if self.skip == 0 and self.in_article:
@@ -207,8 +215,12 @@ def extract_statement_text(html_bytes):
     html = html_bytes.decode("utf-8", errors="replace")
     p = _TextExtract()
     p.feed(html)
+    text = "".join(p.buf)
+    # 健康检查：声明正文必须含 "Committee" 且足够长，否则判定抽取失败
+    if "Committee" not in text or len(text.strip()) < 800:
+        return None
     lines = []
-    for ln in "".join(p.buf).split("\n"):
+    for ln in text.split("\n"):
         ln = re.sub(r"\s+", " ", ln).strip()
         if ln and not _BOILERPLATE_RE.match(ln):
             lines.append(ln)
@@ -226,21 +238,56 @@ def fetch_statement(date_str):
     return None, None
 
 
+def _word_diff(old_para, new_para):
+    """单段词级 diff，返回标记字符串。相似度过低视为整段替换(返回 None)。"""
+    ow, nw = old_para.split(), new_para.split()
+    sm = difflib.SequenceMatcher(None, ow, nw)
+    if sm.ratio() < 0.5:
+        return None
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            out.append(" ".join(ow[i1:i2]))
+        elif tag == "delete":
+            out.append(f"[-{' '.join(ow[i1:i2])}-]")
+        elif tag == "insert":
+            out.append(f"[+{' '.join(nw[j1:j2])}+]")
+        elif tag == "replace":
+            out.append(f"[-{' '.join(ow[i1:i2])}-][+{' '.join(nw[j1:j2])}+]")
+    return " ".join(out)
+
+
 def sentence_diff(old_text, new_text):
-    """行级 diff:返回 (新增行, 删除行)。声明正文每段一行,行级对比噪声最小。"""
-    def lines(t):
+    """段落对齐 + 段内词级 diff:返回 (added, removed)。
+
+    段落按顺序对齐;同名段内做词级 diff 只标真正变化的词;整段增删则整段返回。
+    """
+    def paras(t):
         return [ln.strip() for ln in t.split("\n") if ln.strip()]
 
-    sm = difflib.SequenceMatcher(None, lines(old_text), lines(new_text))
+    op, np_ = paras(old_text), paras(new_text)
+    sm = difflib.SequenceMatcher(None, op, np_)
     added, removed = [], []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "insert":
-            added.extend(lines(new_text)[j1:j2])
+        if tag == "equal":
+            continue
+        elif tag == "insert":
+            added.extend(np_[j1:j2])
         elif tag == "delete":
-            removed.extend(lines(old_text)[i1:i2])
+            removed.extend(op[i1:i2])
         elif tag == "replace":
-            removed.extend(lines(old_text)[i1:i2])
-            added.extend(lines(new_text)[j1:j2])
+            n = min(i2 - i1, j2 - j1)
+            for k in range(n):
+                wd = _word_diff(op[i1 + k], np_[j1 + k])
+                if wd is None:
+                    removed.append(op[i1 + k])
+                    added.append(np_[j1 + k])
+                else:
+                    added.append(wd)
+            if i2 - i1 > n:
+                removed.extend(op[i1 + n:i2])
+            if j2 - j1 > n:
+                added.extend(np_[j1 + n:j2])
     return added, removed
 
 
