@@ -1,6 +1,6 @@
 {
   "name": "千里眼 Alpha-Scout 投资情报 Agent 集群",
-  "description": "可付费的 AI 情报 agent 服务。当前已上线付费能力:每日前沿情报简报(读真实情报库 GO 信号)。买家(其他 agent 或人类)通过 A2A 协议发现并调用,按次付款,收款走 TRON USDT(TRC-20)。规划中技能:回测账本审计、机会尽调、策略盈利性审计、竞品监控。",
+  "description": "可付费的 AI 情报 agent 服务。当前已上线付费能力:每日前沿情报简报(读真实情报库 GO 信号)。买家(其他 agent 或人类)通过 A2A 协议发现并调用,收款走 TRON USDT(TRC-20)。定价:免费 Sample / $9 单期 / $19 周订 / $49 月订(年订暂缓)。规划中技能:回测账本审计、机会尽调、策略盈利性审计、竞品监控。",
   "supportedInterfaces": [
     {
       "url": "https://web3project.top/a2a/v1",
@@ -12,7 +12,7 @@
     "organization": "千里眼 (alpha-scout)",
     "url": "https://web3project.top"
   },
-  "version": "0.2.0",
+  "version": "0.3.0",
   "documentationUrl": "https://web3project.top/docs",
   "capabilities": {
     "streaming": false,
@@ -40,7 +40,7 @@
     }
   ],
   "x402-payment": {
-    "note": "自拟扩展字段(非 A2A 官方 schema)。x402 参考 facilitator(Coinbase)不含 TRON,此处按 A2A-x402 的 PaymentRequirements 结构自拟 TRON USDT(TRC-20)收款方案,由自建 facilitator 经 TronGrid 验到账(唯一金额尾数匹配)。每笔订单金额动态生成:定价 $5 + 唯一尾数 1-99 分(即 $5.01-$5.99),用于订单标识。maxAmountRequired 仅为范围上限,真实付款金额以运行时 payment-required 响应的 extra.exactAmountRaw/amountUsd 为准,必须精确支付(多付少付均无法匹配)。",
+    "note": "自拟扩展字段(非 A2A 官方 schema)。x402 参考 facilitator(Coinbase)不含 TRON,此处按 A2A-x402 的 PaymentRequirements 结构自拟 TRON USDT(TRC-20)收款方案,由自建 facilitator 经 TronGrid 验到账。独立地址架构:每订单从 HD 钱包(m/44'/195'/0'/0/N)派生独立子地址收款,归属无歧义(已替代旧的共享地址+金额尾数匹配)。付款金额=所选 SKU 定价(single $9.00 / weekly $19.00 / monthly $49.00),付款地址在运行时 payment-required 响应的 x402.payment.required.accepts[0].payTo 动态返回(每订单一地址),不要按本卡静态 payTo 直接付款。maxAmountRequired 仅为月订 $49 的范围上限。",
     "accepts": [
       {
         "scheme": "trc20-usdt-exact",
@@ -48,10 +48,10 @@
         "asset": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
         "assetSymbol": "USDT",
         "payTo": "TLnnmqLiY4CE8bnekow6ikpjDHoytJP5p3",
-        "maxAmountRequired": "5990000",
+        "maxAmountRequired": "49000000",
         "amountUnit": "usdt-6dp",
-        "payment-matching": "unique-decimal-tail (1-99 cents), per-order, 60-min window",
-        "verify": "TronGrid trc20 transfer polling (only_confirmed, contract_address=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t)"
+        "payment-matching": "per-order HD-derived sub-address (m/44'/195'/0'/0/N); runtime payTo in payment-required response",
+        "verify": "TronGrid trc20 transfer polling (only_confirmed, contract_address=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t, to=sub-address)"
       }
     ]
   }
