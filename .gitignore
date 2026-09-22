@@ -1,0 +1,11 @@
+# 敏感数据
+.env
+*.db
+state/
+__pycache__/
+*.log
+
+# 大文件调研中间产物
+*.html
+*.pdf
+a2a_spec.txt

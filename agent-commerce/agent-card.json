@@ -1,0 +1,94 @@
+{
+  "name": "千里眼 Alpha-Scout 投资情报 Agent 集群",
+  "description": "面向 web3/美股/外汇/AI 领域的可付费 agent 服务:每日前沿情报简报、回测组合资金账本审计、机会筛选与尽调、策略盈利性审计、竞品重大新闻监控。买家(其他 agent 或人类)通过 A2A 协议发现并调用,按次/按单付款,收款走 TRON USDT(TRC-20)。",
+  "supportedInterfaces": [
+    {
+      "url": "https://web3project.top/a2a/v1",
+      "protocolBinding": "JSONRPC",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "provider": {
+    "organization": "千里眼 (alpha-scout)",
+    "url": "https://web3project.top"
+  },
+  "version": "0.1.0",
+  "documentationUrl": "https://web3project.top/docs",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false,
+    "extendedAgentCard": false,
+    "extensions": [
+      {
+        "uri": "https://github.com/google-a2a/a2a-x402/v0.1",
+        "description": "Supports payments using the x402 protocol for on-chain settlement (TRON USDT via custom scheme).",
+        "required": true
+      }
+    ]
+  },
+  "defaultInputModes": ["text/plain", "application/json"],
+  "defaultOutputModes": ["text/plain", "application/json", "text/markdown"],
+  "skills": [
+    {
+      "id": "daily-intel-brief",
+      "name": "每日前沿情报简报",
+      "description": "全球前沿信源地图与扫描:web3/美股/外汇/AI 每日情报采集、去重、事件告警与简报。",
+      "tags": ["intel", "daily-brief", "web3", "equities", "forex", "ai"],
+      "examples": ["生成今天的 web3+美股+AI 前沿情报简报", "监控某赛道 24 小时重大事件"],
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/markdown", "text/plain"]
+    },
+    {
+      "id": "backtest-accounting-audit",
+      "name": "回测组合收益与资金账本审计",
+      "description": "计算/审计回测的组合收益与资金账本:等权组合算术平均、逐笔全精度、缺失资产固定分母。",
+      "tags": ["backtest", "accounting", "audit", "pnl"],
+      "examples": ["审计这套回测的组合收益率与资金账本是否算对"],
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["application/json", "text/markdown"]
+    },
+    {
+      "id": "deal-screening-diligence",
+      "name": "机会筛选与尽调",
+      "description": "跨 web3/美股/外汇/AI 的六问筛选 + 红旗分级 + 证据分级 + memo 输出。",
+      "tags": ["deal", "screening", "diligence", "memo"],
+      "examples": ["对这个项目做六问尽调并给出红旗分级"],
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/markdown"]
+    },
+    {
+      "id": "strategy-profitability-audit",
+      "name": "策略盈利性审计",
+      "description": "判断一个回测策略是否真能赚钱:成本建模、统计功效、选择偏差、盈亏平衡。",
+      "tags": ["strategy", "profitability", "audit", "backtest"],
+      "examples": ["判断这个策略是否真能赚钱,给出盈亏平衡点"],
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["text/markdown", "application/json"]
+    },
+    {
+      "id": "competitor-news-monitor",
+      "name": "竞品重大新闻监控",
+      "description": "监控指定公司/项目的重大新闻,产出带引用来源的摘要。",
+      "tags": ["monitor", "news", "competitor", "citations"],
+      "examples": ["监控某三家竞品公司本周重大新闻"],
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/markdown"]
+    }
+  ],
+  "x402-payment": {
+    "note": "自拟扩展字段(非 A2A 官方 schema)。A2A 官方 Agent Card 不含收款信息;x402 参考 facilitator(Coinbase)仅支持 Base/Solana/Polygon/Stellar,不含 TRON。此处按 A2A-x402 的 PaymentRequirements 结构自拟一个 TRON USDT(TRC-20)收款方案,网络=TRON,由自建 facilitator 经 TronGrid 验到账(唯一金额尾数匹配)。接口 URL 与文档 URL 为占位(example.com 为 RFC 2606 保留域),部署时替换为实际公网域名。",
+    "accepts": [
+      {
+        "scheme": "trc20-usdt-exact",
+        "network": "tron-mainnet",
+        "asset": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+        "assetSymbol": "USDT",
+        "payTo": "TLnnmqLiY4CE8bnekow6ikpjDHoytJP5p3",
+        "maxAmountRequired": "0",
+        "amountUnit": "usdt-6dp",
+        "payment-matching": "unique-decimal-tail (0.01-0.99), per-order, 15-min window",
+        "verify": "TronGrid trc20 transfer polling (only_confirmed, contract_address=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t)"
+      }
+    ]
+  }
+}
