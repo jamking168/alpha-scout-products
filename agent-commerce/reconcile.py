@@ -1,90 +1,109 @@
 #!/usr/bin/env python3
-"""孤儿付款对账脚本 — 把「用户轮询驱动」补上「链上事件驱动」的兜底。
+"""孤儿付款对账脚本 — 独立地址架构下的链上事件驱动兜底。
+
+独立地址架构下, 每订单一个专属地址, 付款归属无歧义。本脚本扫描
+pending/expired 订单的专属地址, 发现「已付款但用户未回传凭证」的,
+自动认领(标记 paid_undelivered), 用户下次轮询即可取货。
 
 每 5 分钟跑一次:
-1. 拉最近 2 小时收款地址的 USDT-TRC20 入账
-2. 找出 tx_hash 未被任何订单认领的
-3. 按金额尾数反查 pending/expired 订单
-   - 唯一匹配 -> 自动认领(标记 paid_undelivered,等用户下次轮询取货)
-   - 多个匹配 -> 告警(人工裁决)
-   - 无匹配 -> 告警(孤儿付款,记录 from 地址用于退款)
+1. 扫描 status IN ('pending','expired') 且近 2 小时内的订单
+2. 查每个订单 receive_address 的入账
+3. 金额精确匹配 -> 自动认领(paid_undelivered)
+4. 金额不符 -> 告警(多付/少付, 记录 from 地址)
 """
-import sys
 import os
 import sqlite3
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from a2a_server import (RECEIVE_ADDRESS, USDT_CONTRACT, DB_PATH,
-                        STATE_DIR, _now_ms, _now_str, fetch_incoming_since)
+from a2a_server import (  # noqa: E402
+    DB_PATH,
+    PAYMENT_WINDOW,
+    STATE_DIR,
+    USDT_CONTRACT,
+    _now_ms,
+    _now_str,
+    fetch_incoming_since,
+)
 
 LOOKBACK_MS = 2 * 3600 * 1000  # 2 小时
 LOG_PATH = os.path.join(STATE_DIR, "reconcile.log")
 
 
-def log(msg):
+def log(msg: str) -> None:
     line = f"[{_now_str()}] {msg}"
     print(line, flush=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
-def main():
+def main() -> None:
     db = sqlite3.connect(DB_PATH, timeout=10)
     db.row_factory = sqlite3.Row
-    min_ts = _now_ms() - LOOKBACK_MS
-    try:
-        txs = fetch_incoming_since(min_ts)
-    except Exception as e:
-        log(f"ERROR: TronGrid 查询失败: {e}")
+    now_ms = _now_ms()
+    orders = db.execute(
+        "SELECT * FROM orders WHERE status IN ('pending','expired') "
+        "AND created_at_ms >= ?",
+        (now_ms - LOOKBACK_MS,),
+    ).fetchall()
+    if not orders:
         db.close()
         return
 
-    for tx in txs:
-        txid = tx.get("transaction_id", "")
-        if not txid:
-            continue
-        if tx.get("to") != RECEIVE_ADDRESS:
-            continue
-        if tx.get("from") == RECEIVE_ADDRESS:
-            continue
-        tok = tx.get("token_info") or {}
-        if tok.get("address") != USDT_CONTRACT:
-            continue
-        # 已认领?
-        if db.execute("SELECT 1 FROM orders WHERE tx_hash=?", (txid,)).fetchone():
-            continue
+    for order in orders:
+        addr = order["receive_address"]
+        tid = order["task_id"][:12]
+        target_raw = order["amount_cents"] * 10000
         try:
-            dec = int(tok.get("decimals", 6))
-            raw = int(tx.get("value", "0"))
-        except (ValueError, TypeError):
+            txs = fetch_incoming_since(
+                addr, order["created_at_ms"], order["created_at_ms"] + PAYMENT_WINDOW * 1000
+            )
+        except Exception as e:
+            log(f"ERROR: {tid}… TronGrid 查询失败: {e}")
             continue
-        if dec != 6:
-            continue
-        amount_cents = raw // 10000
-        from_addr = tx.get("from", "")
-        blk_ms = int(tx.get("block_timestamp", 0) or 0)
-        # 反查 pending/expired 订单
-        cands = db.execute(
-            "SELECT * FROM orders WHERE amount_cents=? AND status IN ('pending','expired') "
-            "AND created_at_ms <= ? AND expires_at_ms >= ?",
-            (amount_cents, blk_ms, blk_ms - LOOKBACK_MS)).fetchall()
-        if len(cands) == 0:
-            log(f"ORPHAN: tx {txid[:12]}… 金额 {amount_cents}分 无匹配订单 (from {from_addr})")
-            continue
-        if len(cands) > 1:
-            log(f"AMBIGUOUS: tx {txid[:12]}… 金额 {amount_cents}分 匹配 {len(cands)} 单,人工裁决")
-            continue
-        # 唯一匹配 -> 自动认领
-        row = cands[0]
-        cur = db.execute(
-            "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=? "
-            "WHERE task_id=? AND status IN ('pending','expired') AND tx_hash IS NULL",
-            (_now_str(), txid, row["task_id"]))
-        db.commit()
-        if cur.rowcount == 1:
-            log(f"AUTO-CLAIM: tx {txid[:12]}… -> order {row['task_id'][:12]}… (金额 {amount_cents}分)")
-        else:
-            log(f"SKIP: tx {txid[:12]}… order {row['task_id'][:12]}… 认领失败(可能并发已认领)")
+        found = None
+        wrong = None
+        for tx in txs:
+            txid = tx.get("transaction_id", "")
+            if not txid:
+                continue
+            if tx.get("to") != addr:
+                continue
+            if tx.get("from") == addr:
+                continue
+            t = tx.get("type")
+            if t is not None and t != "Transfer":
+                continue
+            tok = tx.get("token_info") or {}
+            if tok.get("address") != USDT_CONTRACT:
+                continue
+            try:
+                dec = int(tok.get("decimals", 6))
+                raw = int(tx.get("value", "0"))
+            except (ValueError, TypeError):
+                continue
+            if dec != 6:
+                continue
+            if raw == target_raw:
+                found = txid
+                break
+            wrong = (txid, raw, tx.get("from", ""))
+
+        if found:
+            cur = db.execute(
+                "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=? "
+                "WHERE task_id=? AND status IN ('pending','expired') AND tx_hash IS NULL",
+                (_now_str(), found, order["task_id"]),
+            )
+            db.commit()
+            if cur.rowcount == 1:
+                log(f"AUTO-CLAIM: {tid}… tx {found[:12]}… -> paid_undelivered")
+        elif wrong:
+            log(
+                f"AMOUNT-MISMATCH: {tid}… addr={addr} tx {wrong[0][:12]}… "
+                f"raw={wrong[1]} (期望 {target_raw}) from {wrong[2]}"
+            )
     db.close()
 
 

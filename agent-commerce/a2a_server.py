@@ -5,7 +5,7 @@
 - GET  /.well-known/agent-card.json  -> A2A Agent Card（发现入口）
 - POST /a2a/v1                      -> JSON-RPC 2.0 message/send（调用 + 付费闭环）
 
-付费: TRON USDT(TRC-20)「唯一金额尾数匹配」。
+付费: TRON USDT(TRC-20)「每订单独立收款地址」(HD 派生 m/44'/195'/0'/0/N, 无尾数匹配)。
 金额全程用整数「分」(cents) 计算，杜绝浮点误差。
 
 v2 修复（对应审查报告 P0）:
@@ -29,6 +29,8 @@ import sqlite3
 import time
 import urllib.request
 from contextlib import contextmanager
+
+from hd_wallet import derive_address, load_mnemonic
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -36,13 +38,14 @@ CARD_PATH = os.path.join(BASE, "agent-card.json")
 STATE_DIR = os.path.join(BASE, "state")
 DB_PATH = os.path.join(STATE_DIR, "a2a_orders.db")
 
-RECEIVE_ADDRESS = "TLnnmqLiY4CE8bnekow6ikpjDHoytJP5p3"
+RECEIVE_ADDRESS = "TLnnmqLiY4CE8bnekow6ikpjDHoytJP5p3"  # 归集主地址(子地址收到的 USDT 最终归集到这里)
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 TRON_API = "https://api.trongrid.io/v1"
 INTEL_DB = "/home/jam/.hermes/profiles/alpha-scout/state/intel_library.db"
 
-PRICE_CENTS = 500          # $5.00 = 500 分
-TAIL_MIN, TAIL_MAX = 1, 99  # 尾数 1–99 分（即 $0.01–$0.99）
+PRICE_CENTS = 500          # $5.00 = 500 分(独立地址下无尾数, 固定金额)
+# 独立地址架构: 每订单一个 HD 派生子地址(m/44'/195'/0'/0/N), 替代共享地址+尾数匹配。
+# master mnemonic 从环境变量 TRON_MASTER_MNEMONIC 读取(私钥级, 不落盘, 开单时懒加载)。
 PAYMENT_WINDOW = 3600        # 付款窗口 60 分钟(TRON 出块 3s,手动转账+交易所提币常超时,15 分钟太紧)
 MAX_BODY = 64 * 1024        # 请求体上限 64 KiB
 MAX_DELIVER = 3             # 单订单交付次数上限
@@ -63,7 +66,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
     task_id        TEXT PRIMARY KEY,
     payment_id     TEXT UNIQUE,
-    tail_cents     INTEGER,
+    receive_address TEXT,     -- 订单专属收款地址(HD 派生)
+    address_index  INTEGER,    -- HD 派生序号 m/44'/195'/0'/0/{index}
     amount_cents   INTEGER,
     status         TEXT DEFAULT 'pending',
     created_at_ms  INTEGER,
@@ -74,10 +78,13 @@ CREATE TABLE IF NOT EXISTS orders (
     delivered_count INTEGER DEFAULT 0,
     refund_address TEXT,
     last_check_ms  INTEGER DEFAULT 0,
-    creator_ip     TEXT
+    creator_ip     TEXT,
+    swept          INTEGER DEFAULT 0,   -- 归集状态(0 未归集, 1 已归集)
+    sweep_tx       TEXT,                 -- 归集交易 txid
+    sweep_at       TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ix_tail_active
-    ON orders(tail_cents) WHERE status='pending';
+CREATE UNIQUE INDEX IF NOT EXISTS ix_addr_active
+    ON orders(receive_address) WHERE status='pending';
 """
 
 
@@ -107,6 +114,16 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN last_check_ms INTEGER DEFAULT 0")
         if "creator_ip" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN creator_ip TEXT")
+        if "receive_address" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN receive_address TEXT")
+        if "address_index" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN address_index INTEGER")
+        if "swept" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN swept INTEGER DEFAULT 0")
+        if "sweep_tx" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN sweep_tx TEXT")
+        if "sweep_at" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN sweep_at TEXT")
         c.commit()
 
 
@@ -120,16 +137,6 @@ def _now_str() -> str:
 
 class BriefUnavailable(Exception):
     """情报源暂不可用，不能交付。"""
-
-
-def gen_tail(db) -> int | None:
-    """从当前 pending 未占用的尾数中随机取一个；满则返回 None。
-    调用方须在 BEGIN IMMEDIATE 写事务内调用(过期回收由调用方先行执行)。"""
-    used = {r[0] for r in db.execute("SELECT tail_cents FROM orders WHERE status='pending'")}
-    free = [t for t in range(TAIL_MIN, TAIL_MAX + 1) if t not in used]
-    if not free:
-        return None
-    return secrets.choice(free)
 
 
 def gen_intel_brief() -> str:
@@ -151,9 +158,9 @@ def gen_intel_brief() -> str:
     return "\n".join(lines)
 
 
-def fetch_incoming_since(min_ts_ms: int, max_ts_ms: int | None = None) -> list:
-    """查收款地址在 [min_ts_ms, max_ts_ms] 窗口内到账的 USDT-TRC20。"""
-    url = (f"{TRON_API}/accounts/{RECEIVE_ADDRESS}/transactions/trc20"
+def fetch_incoming_since(address: str, min_ts_ms: int, max_ts_ms: int | None = None) -> list:
+    """查指定地址在 [min_ts_ms, max_ts_ms] 窗口内到账的 USDT-TRC20。"""
+    url = (f"{TRON_API}/accounts/{address}/transactions/trc20"
            f"?only_confirmed=true&limit=200&contract_address={USDT_CONTRACT}"
            f"&min_timestamp={min_ts_ms}&order_by=block_timestamp,asc")
     if max_ts_ms:
@@ -167,11 +174,12 @@ def fetch_incoming_since(min_ts_ms: int, max_ts_ms: int | None = None) -> list:
 
 
 def check_payment(db, order) -> dict | None:
-    """按整数金额精确匹配 + tx_hash 去重 + 时间窗校验。"""
+    """查订单专属地址的入账: 每地址只服务一个订单, 无需尾数匹配/tx 去重, 精确金额验证即可。"""
+    receive_addr = order["receive_address"]
     target_cents = order["amount_cents"]
     created_ms = order["created_at_ms"]
     try:
-        txs = fetch_incoming_since(created_ms, created_ms + PAYMENT_WINDOW * 1000)
+        txs = fetch_incoming_since(receive_addr, created_ms, created_ms + PAYMENT_WINDOW * 1000)
     except Exception as e:
         log.warning("trongrid 查询失败: %s", e)
         return None
@@ -179,13 +187,10 @@ def check_payment(db, order) -> dict | None:
         txid = tx.get("transaction_id", "")
         if not txid:
             continue
-        # 该交易是否已被任何订单消费
-        if db.execute("SELECT 1 FROM orders WHERE tx_hash=?", (txid,)).fetchone():
-            continue
         # 字段在交易顶层，非 token_info
-        if tx.get("to") != RECEIVE_ADDRESS:
+        if tx.get("to") != receive_addr:
             continue
-        if tx.get("from") == RECEIVE_ADDRESS:   # 排除自转/退款
+        if tx.get("from") == receive_addr:   # 排除自转/退款
             continue
         t = tx.get("type")
         if t is not None and t != "Transfer":   # type 缺失不跳过(部分接口不返回)
@@ -221,7 +226,7 @@ def _rpc_error(rid, code, message):
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
 
-def _payment_required(task_id: str, payment_id: str, amount_cents: int) -> dict:
+def _payment_required(task_id: str, payment_id: str, amount_cents: int, receive_address: str) -> dict:
     amount_usd = amount_cents / 100
     raw = str(amount_cents * 10000)  # 6 位小数最小单位
     return {
@@ -235,7 +240,7 @@ def _payment_required(task_id: str, payment_id: str, amount_cents: int) -> dict:
                 "parts": [{
                     "kind": "text",
                     "text": (f"解锁「每日情报简报」需支付 {amount_usd:.2f} USDT (TRC-20) 到 "
-                             f"{RECEIVE_ADDRESS}。付款后回传 paymentId 即可获取简报。")
+                             f"{receive_address}。付款后回传 paymentId 即可获取简报。")
                 }],
                 "metadata": {
                     "x402.payment.status": "payment-required",
@@ -245,7 +250,7 @@ def _payment_required(task_id: str, payment_id: str, amount_cents: int) -> dict:
                             "scheme": "trc20-usdt-exact",
                             "network": "tron-mainnet",
                             "asset": USDT_CONTRACT,
-                            "payTo": RECEIVE_ADDRESS,
+                            "payTo": receive_address,
                             "maxAmountRequired": raw,
                             "maxTimeoutSeconds": PAYMENT_WINDOW,
                             "extra": {
@@ -254,7 +259,7 @@ def _payment_required(task_id: str, payment_id: str, amount_cents: int) -> dict:
                                 "amountCents": str(amount_cents),
                                 "amountUsd": f"{amount_usd:.2f}",
                                 "exactAmountRaw": raw,
-                                "note": "必须按 exactAmountRaw/amountUsd 精确支付(多付少付均无法匹配);maxAmountRequired 即本订单精确金额"
+                                "note": "本地址为订单专属收款地址, 请按 exactAmountRaw 精确支付;maxAmountRequired 即本订单精确金额"
                             }
                         }]
                     }
@@ -652,7 +657,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(429, _rpc_error(rid, -32005, "new order rate limited"))
                 return
 
-            # 原子开单: BEGIN IMMEDIATE 内完成「回收过期 -> 计数 -> 分配尾数 -> 插入」
+            # 原子开单: BEGIN IMMEDIATE 内完成「回收过期 -> 计数 -> 派生独立地址 -> 插入」
             now_ms = _now_ms()
             try:
                 db.execute("BEGIN IMMEDIATE")
@@ -667,20 +672,22 @@ class Handler(BaseHTTPRequestHandler):
                     db.commit()  # 保留已完成的过期回收
                     self._send(503, _rpc_error(rid, -32004, "too many pending orders, retry later"))
                     return
-                used = {r[0] for r in db.execute("SELECT tail_cents FROM orders WHERE status='pending'")}
-                free = [t for t in range(TAIL_MIN, TAIL_MAX + 1) if t not in used]
-                if not free:
-                    db.commit()
-                    self._send(503, _rpc_error(rid, -32004, "payment slots exhausted, retry later"))
+                # 派生下一个独立收款地址(HD 序号单调递增, 每个地址只服务一个订单, 无尾数归属歧义)
+                try:
+                    mnemonic = load_mnemonic()
+                except RuntimeError:
+                    db.rollback()
+                    self._send(503, _rpc_error(rid, -32004, "payment unavailable, retry later"))
                     return
-                tail_c = secrets.choice(free)
+                next_idx = db.execute("SELECT COALESCE(MAX(address_index), -1) + 1 FROM orders").fetchone()[0]
+                receive_addr = derive_address(mnemonic, next_idx)
                 task_id = f"task-{secrets.token_urlsafe(24)}"
                 payment_id = f"pay-{secrets.token_urlsafe(24)}"
-                amount_cents = PRICE_CENTS + tail_c
+                amount_cents = PRICE_CENTS
                 db.execute(
-                    "INSERT INTO orders (task_id, payment_id, tail_cents, amount_cents, status, "
-                    "created_at_ms, expires_at_ms, creator_ip) VALUES (?,?,?,?,?,?,?,?)",
-                    (task_id, payment_id, tail_c, amount_cents, "pending",
+                    "INSERT INTO orders (task_id, payment_id, receive_address, address_index, amount_cents, status, "
+                    "created_at_ms, expires_at_ms, creator_ip) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (task_id, payment_id, receive_addr, next_idx, amount_cents, "pending",
                      now_ms, now_ms + PAYMENT_WINDOW * 1000, ip))
                 db.commit()
             except sqlite3.IntegrityError:
@@ -691,7 +698,7 @@ class Handler(BaseHTTPRequestHandler):
                 db.rollback()
                 self._send(503, _rpc_error(rid, -32004, "busy, retry later"))
                 return
-            self._send(200, _rpc_result(rid, _payment_required(task_id, payment_id, amount_cents)))
+            self._send(200, _rpc_result(rid, _payment_required(task_id, payment_id, amount_cents, receive_addr)))
 
 
 def main():
