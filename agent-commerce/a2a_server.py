@@ -48,7 +48,27 @@ TRON_API = "https://api.trongrid.io/v1"
 INTEL_DB = "/home/jam/.hermes/profiles/alpha-scout/state/intel_library.db"
 TRON_ADDR_RE = __import__("re").compile(r'^T[1-9A-HJ-NP-Za-km-z]{33}$')  # TRON base58check 地址格式
 
-PRICE_CENTS = 500          # $5.00 = 500 分(独立地址下无尾数, 固定金额)
+# ── 价格体系（分层结构固定, 具体数字可调）────────────────────────
+# 体系(固定): 免费 Sample / 单期 Single / 月订 Monthly / 年订 Annual / 定制 Custom
+# 用户只调下面各数字, 不改分层结构。
+PRICE_CENTS = {
+    "single":  1900,     # $19 单期(试用入口, 30 天内升级月订可抵扣)
+    "monthly": 12900,    # $129 月订(主力 SKU)
+    "annual":  129000,   # $1,290 年订(等效 $107.5/月)
+}
+EARLYBIRD_CENTS = 9900   # $99 早鸟月订(前 30 名, 运营层, 不属 SKU 体系)
+EARLYBIRD_LIMIT = 30
+SKU_DAYS = {             # 各 SKU 有效期(天); 0 = 按次(固化快照)
+    "single": 0,
+    "monthly": 30,
+    "annual": 365,
+}
+DEFAULT_SKU = "single"
+SKU_NAME = {             # SKU 展示名(仅文案用)
+    "single": "单期简报",
+    "monthly": "月订（每日简报 · 30 天）",
+    "annual": "年订（每日简报 · 365 天）",
+}
 # 独立地址架构: 每订单一个 HD 派生子地址(m/44'/195'/0'/0/N), 替代共享地址+尾数匹配。
 # master mnemonic 从环境变量 TRON_MASTER_MNEMONIC 读取(私钥级, 不落盘, 开单时懒加载)。
 PAYMENT_WINDOW = 3600        # 付款窗口 60 分钟(TRON 出块 3s,手动转账+交易所提币常超时,15 分钟太紧)
@@ -88,7 +108,9 @@ CREATE TABLE IF NOT EXISTS orders (
     swept          INTEGER DEFAULT 0,   -- 归集状态(0 未归集, 1 已归集)
     sweep_tx       TEXT,                 -- 归集交易 txid
     sweep_at       TEXT,
-    fund_tx        TEXT                  -- TRX 充值交易 txid(幂等标记, 防重复充值)
+    fund_tx        TEXT,                 -- TRX 充值交易 txid(幂等标记, 防重复充值)
+    sku            TEXT DEFAULT 'single', -- SKU(single/monthly/annual)
+    access_until_ms INTEGER DEFAULT 0     -- 订阅有效期截止毫秒(订阅订单才有值)
 );
 CREATE TABLE IF NOT EXISTS hd_counter (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -139,6 +161,10 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN payment_exception TEXT")
         if "refund_requested_at" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN refund_requested_at TEXT")
+        if "sku" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN sku TEXT DEFAULT 'single'")
+        if "access_until_ms" not in cols:
+            c.execute("ALTER TABLE orders ADD COLUMN access_until_ms INTEGER DEFAULT 0")
         # 迁移完成后再建索引(先补列再建索引, 避免旧库无列时报错)
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_addr_unique ON orders(receive_address)")
         # 旧架构迁移: 无独立地址的旧 pending 订单作废(旧共享地址+尾数架构已废弃)
@@ -293,9 +319,10 @@ def _rpc_error(rid, code, message):
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
 
-def _payment_required(task_id: str, payment_id: str, amount_cents: int, receive_address: str) -> dict:
+def _payment_required(task_id: str, payment_id: str, amount_cents: int, receive_address: str, sku: str = "single") -> dict:
     amount_usd = amount_cents / 100
     raw = str(amount_cents * 10000)  # 6 位小数最小单位
+    name = SKU_NAME.get(sku, "简报")
     return {
         "kind": "task",
         "id": task_id,
@@ -306,7 +333,7 @@ def _payment_required(task_id: str, payment_id: str, amount_cents: int, receive_
                 "role": "agent",
                 "parts": [{
                     "kind": "text",
-                    "text": (f"解锁「每日情报简报」需支付 {amount_usd:.2f} USDT (TRC-20) 到 "
+                    "text": (f"解锁「{name}」需支付 {amount_usd:.2f} USDT (TRC-20) 到 "
                              f"{receive_address}。\n"
                              f"⚠️ 若从交易所提币，请把提币数量设为能让到账 ≥ {amount_usd:.2f} USDT 的值"
                              f"（多数交易所 TRC20 提币扣 1 USDT 手续费，即需提 {amount_usd + 1:.2f}）。\n"
@@ -550,6 +577,24 @@ class Handler(BaseHTTPRequestHandler):
                         row["task_id"], "订单处于退款审核中，暂停自动交付；请联系支持。")))
                     return
 
+                # 订阅订单(monthly/annual): 有效期内每次现取最新, 不固化快照
+                if (row["sku"] or "single") in ("monthly", "annual") and row["status"] == "paid":
+                    if _now_ms() > (row["access_until_ms"] or 0):
+                        self._send(200, _rpc_error(rid, -32011, "subscription expired, please renew"))
+                        return
+                    try:
+                        brief = gen_intel_brief()
+                    except BriefUnavailable as e:
+                        self._send(200, _rpc_result(rid, _working(row["task_id"], str(e))))
+                        return
+                    db.execute("UPDATE orders SET delivered_count=delivered_count+1 WHERE task_id=?",
+                               (row["task_id"],))
+                    db.commit()
+                    self._send(200, _rpc_result(rid, _completed(
+                        row["task_id"], brief,
+                        {"success": True, "transaction": row["tx_hash"], "network": "tron-mainnet"})))
+                    return
+
                 if row["status"] == "paid" and row["artifact"]:
                     # 已固化内容: 幂等重取, 但设硬上限(payment_id 虽是 secret, 防 task_id 泄露路径的无限白嫖)
                     if (row["delivered_count"] or 0) >= MAX_DELIVER:
@@ -687,12 +732,20 @@ class Handler(BaseHTTPRequestHandler):
                         notice += f" 已收到退款地址 {refund_addr[:8]}…，退款待人工处理。"
                     self._send(200, _rpc_result(rid, _working(row["task_id"], notice)))
                     return
-                # 固化交付物: 条件更新(artifact IS NULL + 状态约束),并发下只允许写入一次
-                cur2 = db.execute(
-                    "UPDATE orders SET artifact=?, delivered_count=delivered_count+1, status='paid' "
-                    "WHERE task_id=? AND artifact IS NULL AND tx_hash=? "
-                    "AND status IN ('paid_undelivered','refund_requested') AND refund_requested_at IS NULL",
-                    (brief, row["task_id"], hit["tx_hash"]))
+                # 固化交付物: 订阅订单不固化快照(每次现取最新), 单次订单固化 artifact
+                is_sub = (row["sku"] or "single") in ("monthly", "annual")
+                if is_sub:
+                    cur2 = db.execute(
+                        "UPDATE orders SET delivered_count=delivered_count+1, status='paid' "
+                        "WHERE task_id=? AND artifact IS NULL AND tx_hash=? "
+                        "AND status IN ('paid_undelivered','refund_requested') AND refund_requested_at IS NULL",
+                        (row["task_id"], hit["tx_hash"]))
+                else:
+                    cur2 = db.execute(
+                        "UPDATE orders SET artifact=?, delivered_count=delivered_count+1, status='paid' "
+                        "WHERE task_id=? AND artifact IS NULL AND tx_hash=? "
+                        "AND status IN ('paid_undelivered','refund_requested') AND refund_requested_at IS NULL",
+                        (brief, row["task_id"], hit["tx_hash"]))
                 if cur2.rowcount == 0:
                     db.rollback()
                     won = db.execute("SELECT status, artifact FROM orders WHERE task_id=?", (row["task_id"],)).fetchone()
@@ -701,6 +754,8 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     if won and won["artifact"]:
                         brief = won["artifact"]
+                    elif is_sub and won and won["status"] == "paid":
+                        pass  # 订阅已并发激活, 返回现取的 brief
                     else:
                         self._send(200, _rpc_error(rid, -32006, "order state changed, retry"))
                         return
@@ -827,12 +882,19 @@ class Handler(BaseHTTPRequestHandler):
                 receive_addr = derive_address(mnemonic, next_idx)
                 task_id = f"task-{secrets.token_urlsafe(24)}"
                 payment_id = f"pay-{secrets.token_urlsafe(24)}"
-                amount_cents = PRICE_CENTS
+                # 识别 SKU(从 metadata 的 x402.product, 默认 single); 分层结构固定, 数字从 PRICE_CENTS 取
+                sku = meta.get("x402.product") or DEFAULT_SKU
+                if sku not in PRICE_CENTS:
+                    sku = DEFAULT_SKU
+                amount_cents = PRICE_CENTS[sku]
+                access_until_ms = 0
+                if SKU_DAYS[sku] > 0:
+                    access_until_ms = now_ms + SKU_DAYS[sku] * 24 * 3600 * 1000
                 db.execute(
                     "INSERT INTO orders (task_id, payment_id, receive_address, address_index, amount_cents, status, "
-                    "created_at_ms, expires_at_ms, creator_ip) VALUES (?,?,?,?,?,?,?,?,?)",
+                    "created_at_ms, expires_at_ms, creator_ip, sku, access_until_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (task_id, payment_id, receive_addr, next_idx, amount_cents, "pending",
-                     now_ms, now_ms + PAYMENT_WINDOW * 1000, ip))
+                     now_ms, now_ms + PAYMENT_WINDOW * 1000, ip, sku, access_until_ms))
                 db.commit()
             except sqlite3.IntegrityError:
                 db.rollback()
@@ -843,7 +905,7 @@ class Handler(BaseHTTPRequestHandler):
                 db.rollback()
                 self._send(503, _rpc_error(rid, -32004, "busy, retry later"))
                 return
-            self._send(200, _rpc_result(rid, _payment_required(task_id, payment_id, amount_cents, receive_addr)))
+            self._send(200, _rpc_result(rid, _payment_required(task_id, payment_id, amount_cents, receive_addr, sku)))
 
 
 def _ip_key(ip: str) -> str:
