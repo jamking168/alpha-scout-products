@@ -187,6 +187,17 @@ def main() -> None:
             except Exception as e:
                 log(f"BUILD FAIL {tid}… {e}")
                 continue
+            # 0.5 上次归集广播后崩溃恢复: sweep_tx 已落盘但未确认, 验回执, 不重复归集
+            if order["sweep_tx"] and order["sweep_tx"] != "NO_BALANCE" and not order["swept"]:
+                ok, receipt = wait_for_result(client, order["sweep_tx"])
+                if ok:
+                    db.execute("UPDATE orders SET swept=1, sweep_at=? WHERE task_id=?",
+                               (_now_str(), order["task_id"]))
+                    db.commit()
+                    log(f"RECONFIRM SWEPT {tid}… tx={order['sweep_tx'][:12]}… 上次已上链, 补记 swept")
+                else:
+                    log(f"HOLD {tid}… 上次归集 tx={order['sweep_tx'][:12]}… 状态未知, 人工核查")
+                continue
             # 1. 查 USDT 实际余额(不是订单金额, 多付/重复付款都归集)
             bal = get_usdt_balance(client, from_addr)
             if bal is None:
@@ -229,10 +240,10 @@ def main() -> None:
                     break  # 主地址没钱了, 后续订单也充不了, 直接停(不是 continue)
                 try:
                     fund_txn = build_trx_transfer(client, RECEIVE_ADDRESS, main_priv, from_addr, deficit)
-                    fr = fund_txn.broadcast()
-                    ftx = fr.get("txid")
+                    ftx = fund_txn.txid  # 离线计算 txid, 广播前先落盘(防广播后崩溃导致重复充值)
                     db.execute("UPDATE orders SET fund_tx=? WHERE task_id=?", (ftx, order["task_id"]))
                     db.commit()
+                    fr = fund_txn.broadcast()
                     log(f"TRX-FUND {tid}… tx={ftx} amount={deficit / 1e6:.2f}")
                     ok, _ = wait_for_result(client, ftx)
                     if not ok:
@@ -244,8 +255,10 @@ def main() -> None:
             # 5. 归集 USDT(全部实际余额)
             try:
                 usdt_txn = build_transfer(client, from_addr, priv, RECEIVE_ADDRESS, bal)
+                txid = usdt_txn.txid  # 离线计算 txid, 广播前先落盘(防广播后崩溃, 下轮 RECONFIRM 不重复归集)
+                db.execute("UPDATE orders SET sweep_tx=? WHERE task_id=?", (txid, order["task_id"]))
+                db.commit()
                 result = usdt_txn.broadcast()
-                txid = result.get("txid")
             except Exception as e:
                 log(f"SWEEP FAIL {tid}…: {e}")
                 continue
