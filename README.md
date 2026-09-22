@@ -10,15 +10,16 @@
 
 情报扫描每天从 web3 / 美股 / 外汇 / AI 前沿信源采集、去重、分级（GO / HOLD / PASS）。
 对升级为 **GO** 的商机，按「能否用程序员 + 海外 VPS + agent 集群直接落地赚钱」标准二次筛选，
-落地为三个可运行产品：
+落地为四个可运行产品：
 
 | 子项目 | 定位 | 状态 |
 |---|---|---|
-| `agent-commerce/` | AI 代理支付（x402/A2A）：让 agent 集群变成「可被其他 agent 付费调用」的服务 | ✅ 已上线 |
+| `agent-commerce/` | AI 代理支付（x402/A2A）：让 agent 集群变成「可被其他 agent 付费调用」的服务 | ✅ 已上线（独立地址架构） |
 | `rwa-monitor/` | 印度/主权 RWA 链上资金流监控：DeFiLlama 一手数据，每日快照 | ✅ 已上线（cron 每日跑） |
 | `fomc-diff/` | FOMC 决议即时 diff 信息产品：声明措辞 + 点阵图量化 | ✅ demo 跑通（1 硬依赖待解） |
+| `polymarket-jev/` | Polymarket 决议滞后扫描器（Jev 模型）：找价格未追上已发布事实的市场 | ✅ fork 落地（edge 待验证） |
 
-三者共享同一**收款底座**：TRON USDT（TRC-20），唯一金额尾数匹配，无需 memo。
+四者共享同一**收款底座**：TRON USDT（TRC-20），**每订单独立 HD 派生子地址**（m/44'/195'/0'/0/N，无尾数匹配，付款归属无歧义）。
 
 ---
 
@@ -29,7 +30,10 @@ alpha-scout-products/
 ├── README.md                    # 本文件（项目总结）
 ├── .gitignore
 ├── agent-commerce/              # ① AI 代理支付
-│   ├── a2a_server.py            #   A2A Merchant 服务（x402 付费，纯标准库）
+│   ├── a2a_server.py            #   A2A Merchant 服务（x402 付费）
+│   ├── hd_wallet.py             #   HD 钱包派生（bip_utils + tronpy，m/44'/195'/0'/0/N）
+│   ├── sweep.py                 #   归集脚本（子地址 USDT → 主地址）
+│   ├── reconcile.py             #   孤儿付款对账（链上事件驱动兜底）
 │   ├── agent-card.json          #   A2A Agent Card（发现入口）
 │   ├── 调研简报.md               #   三协议调研（x402/ACP/TAP）与落地判断
 │   └── references/              #   一手规范证据（A2A-x402 扩展等）
@@ -51,7 +55,7 @@ alpha-scout-products/
 ### ① agent-commerce —— 供给侧卡位，按次收费
 - **收入来源**：任何 agent（或人类）通过标准 A2A 协议发现并调用你的能力，**按次付 USDT**。
 - **定价**：首个付费技能「每日情报简报」$5/次；后续可挂「回测审计」「尽调」「竞品监控」等分层技能。
-- **收款**：TRON USDT，唯一金额尾数匹配（尾数 0.01–0.99 即订单标识）。
+- **收款**：TRON USDT，每订单独立 HD 派生子地址（无尾数匹配，付款归属无歧义；归集脚本批量回收）。
 - **分发**：已登记 A2A 官方社区注册表 a2a-registry.org，可被其他 agent 搜到。
 - **本质**：不是等买家来 landing 下单，而是进入「AI agent 经济」的供给侧。
 
@@ -65,6 +69,12 @@ alpha-scout-products/
 - **差异化**：机器逐句措辞 diff + 点阵图中位数量化 + 可编程告警，是「信号输入」不是「新闻转发」。
 - **风险**：免费替代品（财联社等）丰富，必须靠「逐句 diff + 量化 + 可编程」的机器能力差异化。
 
+### ④ polymarket-jev —— 决议滞后信号层
+- **来源**：fork `swang666/polymarket-jev`（145 测试全过），用 TypeSafe 的 Jev 模型做「文本阅读理解」，找「已发布事实已满足决议规则、但价格没追上」的市场。
+- **收入路径**：决议滞后信号订阅 / 喂给 PMBot（韦小宝）做下单执行（alpha-scout 做信号，韦小宝做执行）。
+- **诚实边界**：作者用数据证明 forecast 模式（让 AI 猜价格）塌缩到 base rate，是死路；resolution-lag 模式「几乎拒绝所有市场」，edge 尚未被证明。它不是「马上赚钱的机器」，是「想清楚了 Jev 边界的信号层框架」。
+- **下一步**：申请 Jev key（或验证 `pip install laya` 本地免费替代）→ `--scan` + `--backtest` 验证 Brier gap 是否明显为负 → 有 edge 再谈钱。
+
 ---
 
 ## 四、当前进度（2026-09-22 更新：经双模型审查，P0 已修复）
@@ -73,12 +83,12 @@ alpha-scout-products/
 > P0（错账 / 白嫖 / 宕机 / 错误信号）已全部修复；P1（稳定性 / 合规 / 商业化）待做。
 > 当前定位：**通过代码层修复的产品原型，尚未经真实收款验收，暂不对公众开放收款。**
 
-### ① agent-commerce —— ✅ P0 已修复，待真实收款验收
-- A2A 服务已上线（systemd `a2a-agent.service` 常驻，端口 8898）。
+### ① agent-commerce —— ✅ 独立地址架构落地，待真实收款验收
+- A2A 服务已上线（systemd `a2a-agent.service` 常驻，端口 8898，venv 依赖 + EnvironmentFile 注入 mnemonic）。
 - 公网可发现：`https://web3project.top/.well-known/agent-card.json`；调用端点 `/a2a/v1`。
-- **已修复 P0**：支付字段位置（to/value 在交易顶层）、毫秒时间戳、整数金额（分）、尾数整数槽位+过期回收（消 DoS）、tx_hash 唯一约束+原子认领（消重放）、高熵 ID+幂等（消白嫖）、交付固化+失败不结单（消"收钱发白纸"）、JSON-RPC envelope、请求校验+限流、SQLite WAL。
-- **待验收**：真实 USDT 到账→自动交付（尚未用真钱跑过，收款地址暂无 USDT 记录）。
-- 已登记 a2a-registry.org 目录（unclaimed）。
+- **架构升级（2026-09-22）**：共享地址+尾数匹配 → **每订单独立 HD 派生子地址**（m/44'/195'/0'/0/N，index 0 = 归集主地址）。归属歧义从根删除，配归集脚本（sweep.py）+ 孤儿对账（reconcile.py，每 5 分钟 cron）。
+- **已修复 P0（四轮双模型审查）**：支付字段位置、毫秒时间戳、整数金额、tx_hash 唯一约束+原子认领、高熵 ID+幂等、交付固化+失败不结单、JSON-RPC envelope、请求校验+限流、SQLite WAL、task_id 取货语义（P0-A）、原子开单（P0-1）、认领进写事务（P0-C）。
+- **待验收**：真实 USDT 到账→自动交付（尚未用真钱跑过）。
 
 ### ② rwa-monitor —— ✅ 口径已修正，cron 每日跑
 - 已把误导性的「净流入/流出」改为准确的「TVL 变化」，并加免责声明（TVL 变化 ≠ 资金流）。
@@ -89,6 +99,11 @@ alpha-scout-products/
 - **已修复 P0**：FRED「最近一次变化」不再伪装成「本次会议决议」（标注为"FRED 观测，非本次会议专属"）；SEP 点阵图标注「解析待核验」；load_fred_key 回退环境变量 bug。
 - demo（9/16）：声明 diff 可用（maintain→raise、投票 9-3→12-0）。
 - **待做**：CME FedWatch 地域封锁（且当前代码只测可达性，未实现概率解析）、SEP 表头定位需人工核对。
+
+### ④ polymarket-jev —— ✅ fork 落地，edge 待验证
+- fork 到 `github.com/jamking168/polymarket-jev`（145 测试全过、demo + live 数据跑通）。
+- 定位：决议滞后信号层，归 alpha-scout；有 edge 后信号交给韦小宝 PMBot 执行。
+- **待做**：申请 Jev key（或验证 laya 本地替代）→ `--scan` + `--backtest` 验证 Brier gap。
 
 ### 审查与修复记录（2026-09-22）
 
@@ -125,6 +140,11 @@ alpha-scout-products/
 - [ ] **语义打标**：声明措辞「鹰/鸽」自动打标。
 - [ ] **推送通道**：Telegram bot / webhook + FOMC 日历定时触发。
 - [ ] **历史回测**：误报治理 + 合规标注（非投资建议）。
+
+### ④ polymarket-jev
+- [ ] **申请 Jev key**（或验证 laya 本地替代），跑通 `--scan` + `--backtest`。
+- [ ] **验证 edge**：Brier gap 明显为负跨几十个决议才算有真实 edge，否则诚实 PASS。
+- [ ] **信号交接**：有 edge 后定义信号输出格式，交给韦小宝 PMBot 执行。
 
 ---
 

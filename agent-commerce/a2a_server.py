@@ -679,7 +679,9 @@ class Handler(BaseHTTPRequestHandler):
                     db.rollback()
                     self._send(503, _rpc_error(rid, -32004, "payment unavailable, retry later"))
                     return
-                next_idx = db.execute("SELECT COALESCE(MAX(address_index), -1) + 1 FROM orders").fetchone()[0]
+                # 派生下一个独立收款地址(HD 序号单调递增, 每个地址只服务一个订单)。
+                # index 0 = 归集主地址(RECEIVE_ADDRESS), 子地址从 index 1 开始, 避免撞主地址。
+                next_idx = db.execute("SELECT COALESCE(MAX(address_index), 0) + 1 FROM orders").fetchone()[0]
                 receive_addr = derive_address(mnemonic, next_idx)
                 task_id = f"task-{secrets.token_urlsafe(24)}"
                 payment_id = f"pay-{secrets.token_urlsafe(24)}"
