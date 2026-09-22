@@ -315,8 +315,18 @@ def _sweep_single(client: Tron, mnemonic: str, task_id: str, execute: bool) -> N
                     return
                 log(f"FUND-RECOVER {tid}… 在途充值 {row['fund_tx'][:12]}… 已过有效期且链上查无, 允许重充")
             else:
-                log(f"FUND-HOLD {tid}… 已有在途充值 {row['fund_tx'][:12]}… 状态={fexists}, 勿覆盖重充")
-                return
+                # 链上存在: 判定回执, 区分"历史成功已终结" vs "在途未决"(不能一律当在途)
+                ok_prev, _ = wait_for_result(client, row["fund_tx"], timeout=15)
+                if ok_prev:
+                    # 历史充值已确认成功(上一轮充值+归集闭环已完成), 使命已尽,
+                    # 允许清 fund_tx 后按最新余额重新充值(地址又收到新钱需新 TRX)。
+                    log(f"FUND-REUSE {tid}… 历史充值 {row['fund_tx'][:12]}… 已确认成功, 清 fund_tx 允许新一轮充值")
+                    with db_conn() as db:
+                        db.execute("UPDATE orders SET fund_tx=NULL, fund_at=NULL WHERE task_id=?", (task_id,))
+                        db.commit()
+                else:
+                    log(f"FUND-HOLD {tid}… 已有在途充值 {row['fund_tx'][:12]}… 状态={fexists}, 勿覆盖重充")
+                    return
         main_trx = get_trx_balance(client, RECEIVE_ADDRESS)
         if main_trx is None or main_trx - deficit < MAIN_TRX_FLOOR_SUN:
             log(f"ERROR: {tid}… 主地址 TRX 不足, 请先补 TRX")
@@ -620,9 +630,11 @@ def main() -> None:
                     db.commit()
                 else:
                     # 未认领孤儿(tx_hash IS NULL): 撤销 ORPHAN_RESOLVED 结案, 重新进入孤儿扫描(不伪造 tx_hash)
+                    # 同步清 fund_tx/fund_at: 上一轮"充值+归集"闭环已完成(否则不会 swept=1 结案),
+                    # 旧充值的使命已尽; 再入账重开时若不清, _sweep_single 的在途守卫会把历史成功充值当在途 → 永久 FUND-HOLD。
                     log(f"ORPHAN-RE-ENTRY: {o['task_id'][:12]}… 已结案孤儿再入账 {bal/1e6:.6f}, 撤销结案重新进入孤儿扫描")
                     db.execute(
-                        "UPDATE orders SET swept=0, sweep_tx=NULL, sweep_at=NULL, "
+                        "UPDATE orders SET swept=0, sweep_tx=NULL, sweep_at=NULL, fund_tx=NULL, fund_at=NULL, "
                         "payment_exception = 'ORPHAN-RE-ENTRY: ' || COALESCE(payment_exception,'') WHERE task_id=?",
                         (o["task_id"],))
                     db.commit()
