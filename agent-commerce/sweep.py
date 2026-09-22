@@ -82,6 +82,17 @@ def ensure_schema(db) -> None:
         db.execute("ALTER TABLE orders ADD COLUMN sweep_at TEXT")
     if "fund_tx" not in cols:
         db.execute("ALTER TABLE orders ADD COLUMN fund_tx TEXT")
+    if "fund_at" not in cols:
+        db.execute("ALTER TABLE orders ADD COLUMN fund_at TEXT")
+        # 回填历史行: 旧充值 fund_tx 非空但 fund_at 为 NULL(第15轮之前落盘)。
+        # 以迁移时刻为首次观察时间, 保守等待安全期(5min)后进入链上恢复流程,
+        # 避免 _age_seconds(NULL)==0 导致永久 FUND-HOLD(既不当成已过期立即重出款, 也不永远等不完)。
+        db.execute("UPDATE orders SET fund_at=? WHERE fund_tx IS NOT NULL AND fund_at IS NULL",
+                   (_now_str(),))
+    if "payment_exception" not in cols:
+        db.execute("ALTER TABLE orders ADD COLUMN payment_exception TEXT")
+    if "sku" not in cols:
+        db.execute("ALTER TABLE orders ADD COLUMN sku TEXT DEFAULT 'single'")
     db.commit()
 
 
@@ -208,8 +219,15 @@ def wait_for_result(client: Tron, txid: str, timeout: int = 90):
                 if res is not None:
                     # 合约调用(USDT 归集): result 键存在, 按 SUCCESS 判定
                     return res == "SUCCESS", receipt
-                # 纯 TRX 转账: 无 result 键, 顶层 result=='FAILED' 才是失败
-                return info.get("result") != "FAILED", receipt
+                # 纯 TRX 转账: 无 result 键, 顶层 result 才是成败
+                top = info.get("result")
+                if top == "FAILED":
+                    # 把顶层失败规范化注入 receipt, 让调用方 rcpt_f.get("result") 能读到显式失败。
+                    # 否则顶层 FAILED 信息在返回途中丢失, FUND 分支误判为 HOLD → 永久卡死。
+                    receipt = dict(receipt)
+                    receipt["result"] = "FAILED"
+                    return False, receipt
+                return True, receipt
         except Exception:
             pass
         time.sleep(3)
@@ -596,6 +614,9 @@ def main() -> None:
                 # USDT 已归集(余额 0 或尘埃), 检查残余 TRX 是否该回收(主循环回收失败后的补回收入口)
                 trx_rest = get_trx_balance(client, addr)
                 if trx_rest is not None and trx_rest > TRX_DUST_SUN:
+                    if not args.execute:
+                        log(f"DRY-RUN 补回收 {o['task_id'][:12]}… addr={addr} 残余 {trx_rest / 1e6:.2f} TRX(未广播)")
+                        continue
                     try:
                         priv_o = hd_wallet.derive_private_key(mnemonic, o["address_index"])
                         back = trx_rest - 1_100_000

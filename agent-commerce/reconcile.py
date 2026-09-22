@@ -27,6 +27,7 @@ from a2a_server import (  # noqa: E402
     _now_ms,
     _now_str,
     fetch_incoming_since,
+    init_db,
 )
 
 LOOKBACK_MS = 24 * 3600 * 1000  # 回看 24 小时(原 2 小时覆盖不到交易所提币风控审核导致的迟到付款)
@@ -42,6 +43,7 @@ def log(msg: str) -> None:
 
 
 def main() -> None:
+    init_db()  # 单一 schema 权威源, 幂等补全所有列(消除三份迁移清单漂移导致的 IndexError 崩溃)
     db = sqlite3.connect(DB_PATH, timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
