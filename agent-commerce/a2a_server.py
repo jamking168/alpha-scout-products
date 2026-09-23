@@ -77,6 +77,10 @@ SKU_NAME = {
 # 服务端可自动开单 SKU: 年订暂缓(先积累交付记录+续费观察, 避免提前收一年履约款);
 # custom($2900 起)走人工面谈, 不自动开单(价格已挂出作锚点)。
 ENABLED_SKUS = {"single", "monthly"}
+# ── 灰度开推上限(GPT-6 审查要求: 名额必须有技术上可执行的边界, 不能只在文案写"限量")──
+# 达上限即暂停新增开单; 已有客户的查账/交付/退款照常, 不受影响。
+GRAYSCALE_MAX_PAID = 10       # 首批实际付费订单上限
+GRAYSCALE_MAX_MONTHLY = 5     # 首批月订付费上限
 
 
 def _is_sub(sku: str) -> bool:
@@ -977,6 +981,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, _rpc_error(rid, -32004,
                     "explicit available SKU required: " + ", ".join(sorted(ENABLED_SKUS))))
                 return
+
+            # 灰度名额闸门(技术边界): 实际付费订单/月订达上限即暂停新增开单
+            paid_n = db.execute(
+                "SELECT COUNT(*) FROM orders WHERE status IN ('paid','paid_undelivered')").fetchone()[0]
+            if paid_n >= GRAYSCALE_MAX_PAID:
+                self._send(200, _rpc_error(rid, -32006, "grayscale tier full (paid orders cap reached); new orders paused"))
+                return
+            if sku == "monthly":
+                mo_n = db.execute(
+                    "SELECT COUNT(*) FROM orders WHERE sku='monthly' AND status IN ('paid','paid_undelivered')").fetchone()[0]
+                if mo_n >= GRAYSCALE_MAX_MONTHLY:
+                    self._send(200, _rpc_error(rid, -32006, "grayscale monthly tier full; try single"))
+                    return
 
             # 原子开单: BEGIN IMMEDIATE 内完成「回收过期 -> 计数 -> 派生独立地址 -> 插入」
             now_ms = _now_ms()
