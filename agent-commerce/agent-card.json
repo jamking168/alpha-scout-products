@@ -10,10 +10,10 @@
   ],
   "provider": {
     "organization": "千里眼 (alpha-scout)",
-    "url": "https://web3project.top"
+    "url": "https://web3project.top/intel"
   },
   "version": "0.3.0",
-  "documentationUrl": "https://web3project.top/docs",
+  "documentationUrl": "https://web3project.top/intel",
   "capabilities": {
     "streaming": false,
     "pushNotifications": false,
