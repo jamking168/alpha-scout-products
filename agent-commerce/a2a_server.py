@@ -431,8 +431,8 @@ def _payment_required(task_id: str, payment_id: str, amount_cents: int, receive_
                     "x402.payment.required": {
                         "x402Version": 1,
                         "accepts": [{
-                            "scheme": "trc20-usdt-exact",
-                            "network": "tron-mainnet",
+                            "scheme": "exact",
+                            "network": "tron",
                             "asset": USDT_CONTRACT,
                             "payTo": receive_address,
                             "maxAmountRequired": raw,
