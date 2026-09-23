@@ -1,6 +1,6 @@
 {
   "name": "千里眼 Alpha-Scout 投资情报 Agent 集群",
-  "description": "可付费的 AI 情报 agent 服务。当前已上线付费能力:每日前沿情报简报(读真实情报库 GO 信号)。买家(其他 agent 或人类)通过 A2A 协议发现并调用,收款走 TRON USDT(TRC-20)。定价:免费 Sample / $9 单期 / $19 周订 / $49 月订(年订暂缓)。规划中技能:回测账本审计、机会尽调、策略盈利性审计、竞品监控。",
+  "description": "可付费的 AI 情报 agent 服务。当前已上线付费能力:每日前沿情报简报(读真实情报库 GO 信号)。买家(其他 agent 或人类)通过 A2A 协议发现并调用,收款走 TRON USDT(TRC-20)。定价:免费 Sample / $19 单期 / $129 月订(主力) / $1290 年订(暂缓) / $2900 起定制(人工)。规划中技能:回测账本审计、机会尽调、策略盈利性审计、竞品监控。",
   "supportedInterfaces": [
     {
       "url": "https://web3project.top/a2a/v1",
@@ -40,7 +40,13 @@
     }
   ],
   "x402-payment": {
-    "note": "自拟扩展字段(非 A2A 官方 schema)。x402 参考 facilitator(Coinbase)不含 TRON,此处按 A2A-x402 的 PaymentRequirements 结构自拟 TRON USDT(TRC-20)收款方案,由自建 facilitator 经 TronGrid 验到账。独立地址架构:每订单从 HD 钱包(m/44'/195'/0'/0/N)派生独立子地址收款,归属无歧义(已替代旧的共享地址+金额尾数匹配)。付款金额=所选 SKU 定价(single $9.00 / weekly $19.00 / monthly $49.00),付款地址在运行时 payment-required 响应的 x402.payment.required.accepts[0].payTo 动态返回(每订单一地址),不要按本卡静态 payTo 直接付款。maxAmountRequired 仅为月订 $49 的范围上限。",
+    "note": "自拟扩展字段(非 A2A 官方 schema)。x402 参考 facilitator(Coinbase)不含 TRON,此处按 A2A-x402 的 PaymentRequirements 结构自拟 TRON USDT(TRC-20)收款方案,由自建 facilitator 经 TronGrid 验到账。独立地址架构:每订单从 HD 钱包(m/44'/195'/0'/0/N)派生独立子地址收款,归属无歧义(已替代旧的共享地址+金额尾数匹配)。付款金额=所选 SKU 定价(single $19.00 / monthly $129.00),付款地址在运行时 payment-required 响应的 x402.payment.required.accepts[0].payTo 动态返回(每订单一地址),不要按本卡静态 payTo 直接付款。maxAmountRequired 仅为月订 $129 的范围上限(129 USDT = 129000000 最小单位)。",
+    "products": [
+      {"sku": "single", "priceUsd": "19.00", "available": true, "purchaseMode": "a2a-auto", "periodDays": 0, "note": "当日完整简报"},
+      {"sku": "monthly", "priceUsd": "129.00", "available": true, "purchaseMode": "a2a-auto", "periodDays": 30, "note": "主力档:每日简报,付款确认后连续 30 天"},
+      {"sku": "annual", "priceUsd": "1290.00", "available": false, "purchaseMode": "paused", "periodDays": 365, "note": "暂未开放自动购买"},
+      {"sku": "custom", "priceUsd": "2900.00", "available": false, "purchaseMode": "manual", "periodDays": 0, "note": "需人工洽谈与单独报价,不支持自动下单"}
+    ],
     "accepts": [
       {
         "scheme": "exact",
@@ -48,7 +54,7 @@
         "asset": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
         "assetSymbol": "USDT",
         "payTo": "TLnnmqLiY4CE8bnekow6ikpjDHoytJP5p3",
-        "maxAmountRequired": "49000000",
+        "maxAmountRequired": "129000000",
         "amountUnit": "usdt-6dp",
         "payment-matching": "per-order HD-derived sub-address (m/44'/195'/0'/0/N); runtime payTo in payment-required response",
         "verify": "TronGrid trc20 transfer polling (only_confirmed, contract_address=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t, to=sub-address)"

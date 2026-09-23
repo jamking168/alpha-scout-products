@@ -52,33 +52,35 @@ TRON_ADDR_RE = __import__("re").compile(r'^T[1-9A-HJ-NP-Za-km-z]{33}$')  # TRON 
 # 体系(固定): 免费 Sample / 单期 Single / 月订 Monthly / 年订 Annual / 定制 Custom
 # 用户只调下面各数字, 不改分层结构。
 PRICE_CENTS = {
-    "single":  900,      # $9 单期(指定日期快照, 试用入口)
-    "weekly":  1900,     # $19 周订(7 天, 判断"每天是否有料"的关键试用层)
-    "monthly": 4900,     # $49 月订(30 天, 主力 SKU)
-    "annual":  49000,    # $490 年订(365 天, 暂缓上架: 需先积累交付记录+续费观察)
+    "single":  1900,      # $19 单期(当日完整简报, 试用入口)
+    "monthly": 12900,     # $129 月订(付款确认后连续 30 天交付, 主力 SKU)
+    "annual":  129000,    # $1290 年订(365 天, 等效 $107.5/月; 现金流+锁客户)
+    "custom":  290000,    # $2900 起 定制(定制信源+API 直连; 页面锚点, 走人工面谈)
 }
 # 早鸟价(未实现, 禁止对外宣传): 锁价需要"锁价表+周期计数+续费系统", 实现前不得承诺
-# EARLYBIRD_CENTS = 2900   # $29 早鸟月订锁价(前 50 名, 锁 6 个续费周期)
-# EARLYBIRD_LIMIT = 50
+# EARLYBIRD_CENTS = 9900   # $99 早鸟月订锁价(前 30 名, 对标 Messari Pro)
+# EARLYBIRD_LIMIT = 30
 SKU_DAYS = {
     "single": 0,
-    "weekly": 7,
+    "weekly": 7,      # 已停售: 仅供解释历史 weekly 订单权益, 不参与销售准入(准入只认 ENABLED_SKUS)
     "monthly": 30,
     "annual": 365,
+    "custom": 0,
 }
-DEFAULT_SKU = "single"
+DEFAULT_SKU = "monthly"   # 原则1: 主力是月订, 页面/默认指向 $129/月
 SKU_NAME = {
-    "single": "单期简报（指定日期快照）",
-    "weekly": "周订（每日简报 · 7 天）",
+    "single": "单期简报（当日完整简报）",
     "monthly": "月订（每日简报 · 30 天）",
     "annual": "年订（每日简报 · 365 天）",
+    "custom": "定制（定制信源 + API 直连）",
 }
-# 服务端禁售 SKU(年订暂缓: 需先积累交付记录+续费观察, 避免提前收取一年履约款)
-ENABLED_SKUS = {"single", "weekly", "monthly"}
+# 服务端可自动开单 SKU: 年订暂缓(先积累交付记录+续费观察, 避免提前收一年履约款);
+# custom($2900 起)走人工面谈, 不自动开单(价格已挂出作锚点)。
+ENABLED_SKUS = {"single", "monthly"}
 
 
 def _is_sub(sku: str) -> bool:
-    """统一订阅判定: SKU_DAYS[sku] > 0 即订阅(weekly/monthly/annual), 杜绝散落硬编码列表。"""
+    """统一订阅判定: SKU_DAYS[sku] > 0 即订阅(monthly/annual), 杜绝散落硬编码列表。"""
     return SKU_DAYS.get(sku or DEFAULT_SKU, 0) > 0
 # 独立地址架构: 每订单一个 HD 派生子地址(m/44'/195'/0'/0/N), 替代共享地址+尾数匹配。
 # master mnemonic 从环境变量 TRON_MASTER_MNEMONIC 读取(私钥级, 不落盘, 开单时懒加载)。
@@ -406,7 +408,7 @@ def _rpc_error(rid, code, message):
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
 
-def _payment_required(task_id: str, payment_id: str, amount_cents: int, receive_address: str, sku: str = "single") -> dict:
+def _payment_required(task_id: str, payment_id: str, amount_cents: int, receive_address: str, sku: str) -> dict:
     amount_usd = amount_cents / 100
     raw = str(amount_cents * 10000)  # 6 位小数最小单位
     name = SKU_NAME.get(sku, "简报")
@@ -700,7 +702,7 @@ class Handler(BaseHTTPRequestHandler):
                         row["task_id"], "订单处于退款审核中，暂停自动交付；请联系支持。")))
                     return
 
-                # 订阅订单(weekly/monthly/annual): 有效期内每次现取最新, 不固化快照
+                # 订阅订单(monthly/annual): 有效期内每次现取最新, 不固化快照
                 if _is_sub(row["sku"]) and row["status"] == "paid":
                     if _now_ms() > (row["access_until_ms"] or 0):
                         self._send(200, _rpc_error(rid, -32011,
@@ -869,7 +871,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(200, _rpc_error(rid, -32003, "payment already claimed by another order"))
                         return
                     # 订阅有效期从付款确认时刻起算(而非开单时刻, 避免迟到付款吃掉用户已购天数)
-                    sub_days = SKU_DAYS.get(row["sku"] or "single", 0)
+                    sub_days = SKU_DAYS.get(row["sku"] or DEFAULT_SKU, 0)
                     new_until = _now_ms() + sub_days * 24 * 3600 * 1000 if sub_days > 0 else 0
                     cur = db.execute(
                         "UPDATE orders SET status='paid_undelivered', paid_at=?, tx_hash=?, access_until_ms=? "
@@ -968,11 +970,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             # SKU 校验前移到事务外(禁售 SKU 不进入写事务, 避免 rollback 时 HWM 文件与 DB 计数器失配)
-            sku = meta.get("x402.product") or DEFAULT_SKU
-            if sku not in PRICE_CENTS:
-                sku = DEFAULT_SKU
-            if sku not in ENABLED_SKUS:
-                self._send(200, _rpc_error(rid, -32004, "unknown or unavailable SKU"))
+            # 显式 SKU 准入(审查 P0): 缺失/未知/类型错误一律拒绝, 不回退默认
+            # (防旧客户端传 weekly 被静默开成 $129 月订; 产品「主推月订」靠页面排序/示例, 不靠静默替用户选择)
+            sku = meta.get("x402.product")
+            if not isinstance(sku, str) or sku not in ENABLED_SKUS:
+                self._send(200, _rpc_error(rid, -32004,
+                    "explicit available SKU required: " + ", ".join(sorted(ENABLED_SKUS))))
                 return
 
             # 原子开单: BEGIN IMMEDIATE 内完成「回收过期 -> 计数 -> 派生独立地址 -> 插入」
