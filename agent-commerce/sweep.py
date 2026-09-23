@@ -13,7 +13,7 @@
 用法:
   python3 sweep.py                    # dry-run(默认)
   python3 sweep.py --execute          # 真实广播归集
-  python3 sweep.py --execute --min-sweep 50000000   # 自定义归集阈值(raw, 默认 $50)
+  python3 sweep.py --execute --min-sweep 50000000   # 自定义归集阈值(raw; 默认 $2.5, 见 MIN_SWEEP_RAW)
 """
 from __future__ import annotations
 
