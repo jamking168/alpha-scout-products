@@ -40,7 +40,7 @@ python3 defi_monitor.py --rwa --top 50  # 自定义历史拉取深度
 ## 结构
 
 - `defi_monitor.py` — 主脚本（两模式共用：抓数据 → 规则引擎 → 告警/快照 → 写情报库）
-- `state/defi_monitor.db` — SQLite，存已见过 hack（去重）
+- `state/defi_monitor.db` — SQLite，存已见过 hack（按 id 去重）+ tvl_events（TVL 骤降事件状态，事件驱动去重）
 - `state/snapshots/` — RWA 快照 JSON（带时间戳）
 
 ## 部署
