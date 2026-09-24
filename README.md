@@ -15,7 +15,7 @@
 | 子项目 | 定位 | 状态 |
 |---|---|---|
 | `agent-commerce/` | AI 代理支付（x402/A2A）：让 agent 集群变成「可被其他 agent 付费调用」的服务 | ✅ 已上线（独立地址架构） |
-| `rwa-monitor/` | 印度/主权 RWA 链上资金流监控：DeFiLlama 一手数据，每日快照 | ✅ 已上线（cron 每日跑） |
+| `defi-monitor/` | DeFi 异常监控 + RWA 板块资金流快照：DeFiLlama 一手数据，TVL 骤降 / 新 hack 事件驱动告警 | ✅ 已上线（cron 每小时跑，事件去重） |
 | `fomc-diff/` | FOMC 决议即时 diff 信息产品：声明措辞 + 点阵图量化 | ✅ demo 跑通（1 硬依赖待解） |
 | `polymarket-jev/` | Polymarket 决议滞后扫描器（Jev 模型）：找价格未追上已发布事实的市场 | ✅ fork 落地（edge 待验证） |
 
