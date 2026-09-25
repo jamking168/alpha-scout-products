@@ -9,3 +9,6 @@ __pycache__/
 *.html
 *.pdf
 a2a_spec.txt
+
+# 每日全量快照（体积大；只提交 series.jsonl 与 latest.md 作为时间序列证据）
+x402-tracker/data/snapshots/
