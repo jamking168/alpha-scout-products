@@ -1,0 +1,185 @@
+{
+ "generated_at_utc": "2026-09-25T01:06:58Z",
+ "records": [
+  {
+   "kind": "github",
+   "id": "mizorewww/laya-mlx",
+   "stars": 6225,
+   "forks": 478,
+   "watchers": 20,
+   "open_issues": 17,
+   "created": "2026-09-19",
+   "pushed": "2026-09-22",
+   "age_days": 5.5,
+   "language": "Python",
+   "archived": false,
+   "watcher_ratio_pct": 0.321,
+   "fork_ratio_pct": 7.7,
+   "issues_per_1k_stars": 2.7,
+   "velocity_stars_per_day": 1138.1,
+   "description": "Native MLX runtime for Laya typed decision models — 7–14 ms short decisions on M3 Max. No text generation, PyTorch, or c",
+   "contributors_sampled": 1,
+   "contributors_note": "sampled_first_page_only",
+   "flags": [
+    "LOW_WATCH: 20 watcher / 6225 star = 0.321%（对照基线 0.56%~0.74%）",
+    "FAST_RAMP: 创建 5.5 天，1138.1 star/天（对照 58~153/天）",
+    "SAME_WEEK_CLUSTER: 2026-09 同周冒出的千星级新仓库（需看同批仓库名单）"
+   ]
+  },
+  {
+   "kind": "github",
+   "id": "jev-chat/jev-chat-jarvis",
+   "stars": 6081,
+   "forks": 1097,
+   "watchers": 6,
+   "open_issues": 22,
+   "created": "2026-09-21",
+   "pushed": "2026-09-24",
+   "age_days": 3.6,
+   "language": "Kotlin",
+   "archived": false,
+   "watcher_ratio_pct": 0.099,
+   "fork_ratio_pct": 18.0,
+   "issues_per_1k_stars": 3.6,
+   "velocity_stars_per_day": 1699.0,
+   "description": "装在手机上的对话副驾：在 QQ / X / 飞书里读懂对方、给出候选回复、一键填入输入框，发不发由你。非侵入，只读屏幕，不 hook 不改包。",
+   "contributors_sampled": 1,
+   "contributors_note": "sampled_first_page_only",
+   "flags": [
+    "LOW_WATCH_SEVERE: 6 watcher / 6081 star = 0.099%（对照基线 0.56%~0.74%）",
+    "FAST_RAMP: 创建 3.6 天，1699.0 star/天（对照 58~153/天）",
+    "SAME_WEEK_CLUSTER: 2026-09 同周冒出的千星级新仓库（需看同批仓库名单）"
+   ]
+  },
+  {
+   "kind": "github",
+   "id": "zai-org/ZCode",
+   "stars": 6713,
+   "forks": 2004,
+   "watchers": 40,
+   "open_issues": 11,
+   "created": "2026-09-20",
+   "pushed": "2026-09-24",
+   "age_days": 4.5,
+   "language": "TypeScript",
+   "archived": false,
+   "watcher_ratio_pct": 0.596,
+   "fork_ratio_pct": 29.9,
+   "issues_per_1k_stars": 1.6,
+   "velocity_stars_per_day": 1476.8,
+   "description": "Z.ai's coding agent harness. Powerful, intelligent, extensible.",
+   "contributors_sampled": 1,
+   "contributors_note": "sampled_first_page_only",
+   "flags": [
+    "HIGH_FORK: fork/star = 29.9%（对照上限 20.8%），且与 watcher 极低同时出现",
+    "QUIET_ISSUES: 每千星仅 1.6 个 open issue（对照 14~22）—— 没有真人提问题",
+    "FAST_RAMP: 创建 4.5 天，1476.8 star/天（对照 58~153/天）",
+    "SAME_WEEK_CLUSTER: 2026-09 同周冒出的千星级新仓库（需看同批仓库名单）"
+   ]
+  },
+  {
+   "kind": "github",
+   "id": "mikehasa/golive-skill",
+   "stars": 877,
+   "forks": 60,
+   "watchers": 30,
+   "open_issues": 0,
+   "created": "2026-09-23",
+   "pushed": "2026-09-25",
+   "age_days": 1.5,
+   "language": "TypeScript",
+   "archived": false,
+   "watcher_ratio_pct": 3.421,
+   "fork_ratio_pct": 6.8,
+   "issues_per_1k_stars": 0.0,
+   "velocity_stars_per_day": 593.0,
+   "description": "Take your agent-built product live: hosting, database, domain, email, payments — on your own accounts. Open-source Agent",
+   "contributors_sampled": 1,
+   "contributors_note": "sampled_first_page_only",
+   "flags": [
+    "QUIET_ISSUES: 每千星仅 0.0 个 open issue（对照 14~22）—— 没有真人提问题",
+    "FAST_RAMP: 创建 1.5 天，593.0 star/天（对照 58~153/天）"
+   ]
+  },
+  {
+   "kind": "github",
+   "id": "nokia-applied-research/AnyJev",
+   "stars": 506,
+   "forks": 74,
+   "watchers": 8,
+   "open_issues": 3,
+   "created": "2026-09-21",
+   "pushed": "2026-09-25",
+   "age_days": 3.8,
+   "language": "Python",
+   "archived": false,
+   "watcher_ratio_pct": 1.581,
+   "fork_ratio_pct": 14.6,
+   "issues_per_1k_stars": 5.9,
+   "velocity_stars_per_day": 133.2,
+   "description": "Turn any LLM into a Jev-style decision model: typed decisions, real probabilities, no training. (continue updating)",
+   "contributors_sampled": 1,
+   "contributors_note": "sampled_first_page_only",
+   "flags": []
+  },
+  {
+   "kind": "github",
+   "id": "unreallabsai/unreal-agent",
+   "stars": 1878,
+   "forks": 97,
+   "watchers": 3,
+   "open_issues": 8,
+   "created": "2026-09-21",
+   "pushed": "2026-09-23",
+   "age_days": 3.1,
+   "language": "Go",
+   "archived": false,
+   "watcher_ratio_pct": 0.16,
+   "fork_ratio_pct": 5.2,
+   "issues_per_1k_stars": 4.3,
+   "velocity_stars_per_day": 610.1,
+   "description": "Async-first agent harness",
+   "contributors_sampled": 1,
+   "contributors_note": "sampled_first_page_only",
+   "flags": [
+    "LOW_WATCH_SEVERE: 3 watcher / 1878 star = 0.16%（对照基线 0.56%~0.74%）",
+    "FAST_RAMP: 创建 3.1 天，610.1 star/天（对照 58~153/天）",
+    "SAME_WEEK_CLUSTER: 2026-09 同周冒出的千星级新仓库（需看同批仓库名单）"
+   ]
+  },
+  {
+   "kind": "hf",
+   "id": "convaiinnovations/laya",
+   "likes": 3406,
+   "downloads": 0,
+   "created": "2026-09-18",
+   "author": "convaiinnovations",
+   "pipeline": "text-classification",
+   "likes_per_download": null,
+   "flags": [
+    "DECOUPLED: 点赞数千但下载为 0 —— 热度与使用完全脱钩",
+    "RECENT_SURGE: 该模型创建不到 21 天"
+   ]
+  },
+  {
+   "kind": "hf",
+   "id": "AlexWortega/openjev",
+   "likes": 556,
+   "downloads": 0,
+   "created": "2026-09-16",
+   "author": "AlexWortega",
+   "pipeline": "text-classification",
+   "likes_per_download": null,
+   "flags": [
+    "DECOUPLED: 点赞数千但下载为 0 —— 热度与使用完全脱钩",
+    "RECENT_SURGE: 该模型创建不到 21 天"
+   ]
+  }
+ ],
+ "verdict": {
+  "flag_count": 19,
+  "decoupled_signals": 2,
+  "reading": "采用度指纹不自洽 —— 热度缺少对应的使用痕迹；不能据此认定造假，但足够据此不发教程、不做集成、不把它写进任何产品的依赖里",
+  "limitation": "这是采用度相关性的体检，不是造假的证明；阈值是经验分布不是官方标准；公开 API 的 star/fork/like 都可能被低成本操纵，正向结论（指纹正常）也仅说明「没有异常」，不等于「有真实付费需求」。"
+ }
+}

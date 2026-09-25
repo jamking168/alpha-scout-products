@@ -1,0 +1,53 @@
+{
+ "generated_at_utc": "2026-09-25T01:06:57Z",
+ "records": [
+  {
+   "kind": "github",
+   "id": "huggingface/transformers",
+   "stars": 166616,
+   "forks": 34670,
+   "watchers": 1239,
+   "open_issues": 2390,
+   "created": "2018-10-29",
+   "pushed": "2026-09-25",
+   "age_days": 2887.5,
+   "language": "Python",
+   "archived": false,
+   "watcher_ratio_pct": 0.744,
+   "fork_ratio_pct": 20.8,
+   "issues_per_1k_stars": 14.3,
+   "velocity_stars_per_day": 57.7,
+   "description": "🤗 Transformers: the model-definition framework for state-of-the-art machine learning models in text, vision, audio, and ",
+   "contributors_sampled": 1,
+   "contributors_note": "sampled_first_page_only",
+   "flags": []
+  },
+  {
+   "kind": "github",
+   "id": "ollama/ollama",
+   "stars": 181644,
+   "forks": 17998,
+   "watchers": 1017,
+   "open_issues": 4073,
+   "created": "2023-06-26",
+   "pushed": "2026-09-24",
+   "age_days": 1186.2,
+   "language": "Go",
+   "archived": false,
+   "watcher_ratio_pct": 0.56,
+   "fork_ratio_pct": 9.9,
+   "issues_per_1k_stars": 22.4,
+   "velocity_stars_per_day": 153.1,
+   "description": "Get up and running with Kimi, GLM, MiniMax, DeepSeek, gpt-oss, Qwen, Gemma and other models.",
+   "contributors_sampled": 1,
+   "contributors_note": "sampled_first_page_only",
+   "flags": []
+  }
+ ],
+ "verdict": {
+  "flag_count": 0,
+  "decoupled_signals": 0,
+  "reading": "采用度指纹不自洽 —— 热度缺少对应的使用痕迹；不能据此认定造假，但足够据此不发教程、不做集成、不把它写进任何产品的依赖里",
+  "limitation": "这是采用度相关性的体检，不是造假的证明；阈值是经验分布不是官方标准；公开 API 的 star/fork/like 都可能被低成本操纵，正向结论（指纹正常）也仅说明「没有异常」，不等于「有真实付费需求」。"
+ }
+}
