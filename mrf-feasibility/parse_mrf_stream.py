@@ -85,14 +85,18 @@ def parse_json_stream(fh, want_items, max_scan):
     return top_head, items, scanned
 
 
-def extract(item):
+def extract(item, variant=0):
     """把一条 standard_charge_information 元素规范成三列。
 
-    注意: 不要拿「第一个付款方的价」冒充现金价。现金价必须是
+    注意 1: 不要拿「第一个付款方的价」冒充现金价。现金价必须是
     ① 条目层/付款方层真正的 discounted_cash 字段；或 ② payer_name 为 Cash/Self-pay 的那条。
     都没有就是没有（缺字段本身就是这家医院的合规缺口，要如实标 None）。
+    注意 2: 一个 code 可能挂在**多条** standard_charges variant 上（不同 billing_class/methodology），
+    价格只出现在其中一部分；取 [0] 会解空（UCSF/Stanford 实测）。默认 variant=0 只为打印结构，
+    要取价请先用 pick_priced_variant() 选。
     """
-    sc = (item.get("standard_charges") or [{}])[0]
+    scs = item.get("standard_charges") or [{}]
+    sc = scs[variant] if variant < len(scs) else scs[0]
     payers = sc.get("payers_information") or []
     cash = sc.get("discounted_cash")
     payer_cash = None
@@ -115,6 +119,22 @@ def extract(item):
         "payers": len(payers),
         "first_payer_price": payers[0].get("standard_charge_dollar") if payers else None,
     }
+
+
+def pick_priced_variant(item):
+    """返回 (variant 下标, sc) —— 带金额付款方最多的那条; 都没有则回退第 0 条。"""
+    scs = item.get("standard_charges") or []
+    best, best_score, best_i = None, -1, 0
+    for i, sc in enumerate(scs):
+        score = sum(1 for p in (sc.get("payers_information") or [])
+                    if p.get("standard_charge_dollar") is not None)
+        if sc.get("minimum") is not None:
+            score += 1
+        if score > best_score:
+            best, best_score, best_i = sc, score, i
+    if best is None:
+        return 0, {}
+    return best_i, best
 
 
 def parse_csv(fh, want_items, max_scan):

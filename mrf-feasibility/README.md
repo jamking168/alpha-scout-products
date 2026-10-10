@@ -87,4 +87,43 @@ python3 parse_mrf_stream.py nyp.zip
 脚本已通用化：传入任意 `.json` / `.json.zip` / `.csv` 的 MRF 即可（CSV 走另一条分支，见脚本注释）。
 
 ---
+
+## 4. 第二轮实测（2026-10-11 01:15–01:35）：跨医院比价切片已跑通
+
+判据 GO 之后做的第一件事不是爬全量，而是「**3 家医院 × 1 个码**」的最小切片 —— 产物在
+`slice-3hospitals-20261011/`（`slice_summary.md` + `slice_detail.csv` 106 行 + `README.md`）。
+
+核心读数（MS-DRG 001 心脏移植 / MS-DRG 003 ECMO，三院均为 CMS 文件 version 3.0.0，last_updated_on 2026-03/04）：
+
+| 医院 | 文件体积 | DRG 001 min → max |
+|---|---|---|
+| NewYork-Presbyterian | 229.1 MB（zip 4.0 MB） | $251,298.25 → $2,250,992.88（院内 **8.96x**） |
+| UCSF Medical Center | 91.0 MB | $425,819.41 → $851,638.82 |
+| Stanford Health Care | 154.6 MB | $412,866.98（仅 1 家付款方报价） |
+
+跨院最低谈判价差 **1.69x**（差 $174,521），跨院最高价差 **5.45x**。
+
+**新踩的坑（血泪，已写成代码注释）**
+
+1. **一个码 = 多条 `standard_charges` variant，取 `[0]` 会解空。** UCSF / Stanford 的 MS-DRG 001 都有两条
+   variant：第一条 `methodology: other`（给算法文本、无金额），第二条才有 `minimum`/`maximum` + 逐付款方金额。
+   第一版取 `[0]` 两家都解出 `None` —— 差点误判「UCSF/Stanford 不填价格」。
+   → 新增 `pick_priced_variant()`（`parse_mrf_stream.py`）与全 variant 遍历（`mrf_slice.py`）。
+2. **体积量级坐实**：Northwestern Memorial（nm.org）单个 MRF `Content-Length` = **5,019,534,101 B ≈ 5.0 GB**；
+   NYU Langone Tisch 是 **482 MB 的 CSV** → 全美 6,000+ 家按此量级 ≈ TB，**全量镜像必白干**，只能按需抽码。
+3. **Range 支持与速度差别巨大**：nm.org 支持 Range（206）但只有 0.8 MB/s；NYU 的 S3 8.6 MB/s；Cedars 的 CDN
+   忽略 Range（要 120KB 给整包 716MB）。一律 `--max-filesize` + `--max-time` 双兜底，能整包就别赌 Range。
+4. **`cms-hpt.txt` 可达性（实测 10 家）**：NYP / UCSF / Stanford / NYU / Northwestern / Rush = 200 脚本直达；
+   Mayo 403、Mount Sinai 403(Akamai)、Johns Hopkins Cloudflare 挑战、UCLA 人机验证 → 约 **6/10 纯脚本可拿链**，
+   其余需真实浏览器（本机有 CDP 能力）。
+
+**商业侧仍是未验证。** 切片证明的是「技术能出货」，不是「有人付钱」。验证动作只有一个：把切片拿去问
+self-insured employer / benefits consultant 是否付费。付费信号出现前不做规模化。
+
+新增工具（本目录，均已实测跑通）：
+- `mrf_slice.py <文件> --code 001 --code-type MS-DRG [--setting inpatient] [--out x.jsonl]` —— 扫全文件按码抽切片
+- `compare_mrf_slice.py --out-dir <目录> a.jsonl=医院A b.jsonl=医院B …` —— 合成比价表 + 明细 CSV
+
+---
+
 *本文为情报分析，不构成投资建议。数据来源：医院自行公布的 CMS 法定公开文件（45 CFR 180.50）。*
