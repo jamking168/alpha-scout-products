@@ -153,5 +153,89 @@ class RenderSepStatusTest(unittest.TestCase):
         self.assertIn("Longer run", out)
 
 
+# ---- 2026-11-01 追加：June 对照行容忍空格子（P3）----
+
+HTML_JUNE_WITH_BLANK = """<table>
+<tr><td>2026</td><td>2027</td><td>2028</td><td>2029</td><td>Longer run</td></tr>
+<tr><td>Federal funds rate</td><td>4.1</td><td>4.1</td><td>3.9</td><td>3.6</td><td>3.2</td></tr>
+<tr><td>June projection</td><td>3.8</td><td>3.6</td><td>3.4</td><td></td><td>3.1</td></tr>
+</table>"""
+
+HTML_JUNE_ALL_TEXT = """<table>
+<tr><td>2026</td><td>2027</td><td>2028</td><td>2029</td><td>Longer run</td></tr>
+<tr><td>Federal funds rate</td><td>4.1</td><td>4.1</td><td>3.9</td><td>3.6</td><td>3.2</td></tr>
+<tr><td>June projection</td><td>n.a.</td><td>see note</td><td>tbd</td><td>—</td><td>3.6–4.1</td></tr>
+</table>"""
+
+HTML_MEDIAN_WITH_BLANK = """<table>
+<tr><td>2026</td><td>2027</td><td>2028</td><td>2029</td><td>Longer run</td></tr>
+<tr><td>Federal funds rate</td><td>4.1</td><td>4.1</td><td>3.9</td><td></td><td>3.2</td></tr>
+<tr><td>June projection</td><td>3.8</td><td>3.6</td><td>3.4</td><td>3.3</td><td>3.1</td></tr>
+</table>"""
+
+
+class TestJuneRowLenient(unittest.TestCase):
+    """June 对照行：空格子只占位、不整行作废；非法文本仍整行作废；median 行不放宽。"""
+
+    def setUp(self):
+        self.mod = _load()
+
+    def _fetch_html(self, html):
+        self.mod.http_get = lambda url, ua=None, timeout=30: (200, html.encode())
+        return self.mod.fetch_sep_median("2026-09-16")
+
+    def test_june_with_one_blank_cell_keeps_five_columns(self):
+        r = self._fetch_html(HTML_JUNE_WITH_BLANK)
+        self.assertEqual(r["parse_status"], "verified")
+        self.assertEqual(r["june"], ["3.8", "3.6", "3.4", "", "3.1"])
+        self.assertEqual(len(r["june"]), len(r["years"]))     # 与年份列等长，不丢列
+
+    def test_june_all_text_or_blank_still_rejected(self):
+        r = self._fetch_html(HTML_JUNE_ALL_TEXT)
+        self.assertEqual(r["parse_status"], "verified")       # median 本身是好的
+        self.assertEqual(r["june"], [])                        # 对照行整行作废
+        self.assertNotIn(None, r["june"])
+
+    def test_june_all_blank_is_rejected(self):
+        html = HTML_JUNE_WITH_BLANK.replace(
+            "<td>3.8</td><td>3.6</td><td>3.4</td><td></td><td>3.1</td>",
+            "<td></td><td>—</td><td>n/a</td><td></td><td></td>")
+        self.mod.http_get = lambda url, ua=None, timeout=30: (200, html.encode())
+        r = self.mod.fetch_sep_median("2026-09-16")
+        self.assertEqual(r["june"], [], "非空少于 3 个就不能当对照数据")
+
+    def test_median_row_stays_strict(self):
+        """median 行有一个空格子 → 仍是 unverified（没放宽主行）。"""
+        r = self._fetch_html(HTML_MEDIAN_WITH_BLANK)
+        self.assertEqual(r["parse_status"], "unverified")
+        self.assertIsNone(r["median"])
+
+    def test_render_shows_dash_for_blank_june_cell(self):
+        out = self.mod.render_cn(
+            "2026-09-16", "2026-06-17", FRED, STMT,
+            {"url": "u", "parse_status": "verified",
+             "years": ["2026", "2027", "2028", "2029", "Longer run"],
+             "median": ["4.1", "4.1", "3.9", "3.6", "3.2"],
+             "june": ["3.8", "3.6", "3.4", "", "3.1"]},
+            FW, "/tmp/x.json")
+        line_2029 = [l for l in out.splitlines() if l.strip().startswith("2029")][0]
+        self.assertIn("-", line_2029)
+        self.assertNotIn("None", out)
+        # 有值的列仍显示数字与 bp 差
+        line_2026 = [l for l in out.splitlines() if l.strip().startswith("2026")][0]
+        self.assertIn("3.8", line_2026)
+        self.assertIn("+30bp", line_2026)
+
+    def test_normalize_helper_directly(self):
+        f = self.mod._normalize_june_cells
+        self.assertEqual(f(["3.8", "3.6", "3.4", "", "3.1"]), ["3.8", "3.6", "3.4", "", "3.1"])
+        self.assertEqual(f([""]), None)                     # 非空不足 3 个
+        self.assertEqual(f(["3.8", "3.6", "abc", "", "3.1"]), None)   # 有非法文本
+        self.assertEqual(f(["3.8", "3.6", "3.4", "3.3", "3.1", "3.6–4.1"]),
+                         ["3.8", "3.6", "3.4", "3.3", "3.1"])        # 超出 5 列截断
+        self.assertEqual(f(["3.8", "3.6", "3.4"]), ["3.8", "3.6", "3.4", "", ""])  # 缺列补 ''
+        self.assertEqual(f(["11.0", "3.6", "3.4", "", "3.1"]), None)  # 超 10% 不合法
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -363,6 +363,48 @@ def _valid_rate_cells(cells):
     return True
 
 
+# June 对照行里「该列没有值」的写法：官网会留空，历史数据里也见过破折号/N/A
+_JUNE_EMPTY = {"", "-", "–", "—", "n/a", "na", "n.a.", "·"}
+_RATE_RE = re.compile(r"^\d(\.\d{1,2})?$")
+
+
+def _normalize_june_cells(cells, width=5):
+    """把 June 对照行的数据单元格规整成「合法利率或 ''」，返回与年份列等长的列表；整行作废返回 None。
+
+    为什么放宽（2026-11-01）：官网 2026-09-16 的 `June projection` 行 2029 列**本来就是空单元格**
+    （`["June projection","3.8","3.6","3.4","","3.1","3.6–4.1"]`），旧实现拿 _valid_rate_cells 整行校验，
+    一个空格子就把整行判无效 → 报告里「上次(June)」整列变 `-`，读者分不清"页面留空"还是"解析错了"。
+
+    只放宽 June 对照列，且规则收得很紧：
+      - 空值（""/—/N/A…）记为 ''，占位不填充、不丢列；
+      - 剩下的非空单元格必须**全部**是合法利率（0~10，1~2 位小数）——出现 "3.6–4.1" 这种区间文本仍整行作废；
+      - 非空至少 3 个，否则视为没解析到（防止整行空白/整行文字被当成"有对照数据"）；
+      - 长度对齐年份列（不足补 ''，多余的截掉）。
+    median 主行不走这里，仍是 _valid_rate_cells 严格校验（宁可不输出，不输出错数字）。
+    """
+    if not cells:
+        return None
+    out = []
+    for raw in list(cells)[:width]:
+        s = str(raw).strip().replace("%", "").replace("\u00a0", " ")
+        s = s.replace(" ", "")
+        if s.lower() in _JUNE_EMPTY:
+            out.append("")
+            continue
+        if not _RATE_RE.match(s):
+            return None
+        try:
+            if not (0.0 <= float(s) <= 10.0):
+                return None
+        except ValueError:
+            return None
+        out.append(s)
+    out += [""] * (width - len(out))
+    if sum(1 for v in out if v) < 3:
+        return None
+    return out
+
+
 def _validate_sep(years, frow):
     """校验 SEP 解析结果;通过返回 True,否则 False(宁可不输出,不输出错数字)。"""
     import re
@@ -452,8 +494,10 @@ def fetch_sep_median(date_str):
                 first = str(june_row[0]).strip().lower() if june_row else ""
                 if not any(m in first for m in ("june", "jun", "sep", "dec", "mar", "march", "year", "month")):
                     june_row = None
-            # june 行数值也须通过利率格式校验,否则置 None(防止把错误行当上次中位数)
-            if june_row is not None and not _valid_rate_cells(june_row[1:6] if len(june_row) >= 6 else []):
+            # june 行数值走「容忍空格子」的规整(2026-11-01):空列记 ''、列数对齐年份列;
+            # 出现非法文本或非空少于 3 个 → 整行作废(仍是"宁可不输出,不输出错数字")
+            june_cells = _normalize_june_cells(june_row[1:]) if june_row is not None else None
+            if june_row is not None and june_cells is None:
                 june_row = None
             if not _validate_sep(years, frow):
                 return {
@@ -467,7 +511,7 @@ def fetch_sep_median(date_str):
                 "parse_status": "verified",
                 "years": years,
                 "median": frow[1:6],
-                "june": june_row[1:6] if june_row else [],
+                "june": june_cells if (june_row is not None and june_cells) else [],
             }
     # 页面拿到了但没定位到「年份表头 + federal funds rate 行」→ 与校验失败同属 unverified
     return {
