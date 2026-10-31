@@ -375,18 +375,62 @@ def _validate_sep(years, frow):
     return _valid_rate_cells(frow[1:6] if len(frow) >= 6 else [])
 
 
+def _calendar_has_sep(date_str):
+    """日历表(FOMC_2026)里这次会议是否伴随 SEP;日历里没有该日期 → None(未知)。"""
+    for d, has_sep in FOMC_2026:
+        if d == date_str:
+            return has_sep
+    return None
+
+
+def _is_sep_month(date_str):
+    """美联储只在 3/6/9/12 月会议发布 SEP(点阵图)。"""
+    try:
+        return int(date_str[5:7]) in (3, 6, 9, 12)
+    except (ValueError, IndexError):
+        return False
+
+
 def fetch_sep_median(date_str):
     """抓取并解析 SEP 表,返回联邦基金利率中位数行(含 June 对照)。
 
-    返回 {"years": [...], "median": {...}, "june": {...}, "url": ...}
+    返回 {"years": [...], "median": {...}, "june": {...}, "url": ..., "parse_status": ...}
     年列为 2026/2027/2028/2029/Longer run;median 行第 2~6 个数字单元格。
-    解析未通过校验时返回 parse_status="unverified" 且数值置 None。
+
+    parse_status 四态(2026-10-31 加前两态):
+      - verified       解析通过校验,数值可用(原语义不变);
+      - unverified     页面拿到了但表结构没过 _validate_sep 校验 / 页面里没找到表(原语义不变);
+      - no_sep_meeting 本次会议本来就不发布 SEP(404 + 非 3/6/9/12 月,或日历表明确 False)→ **正常**;
+      - fetch_failed   网络错误/超时/非 404 异常状态码,或 3/6/9/12 月的 SEP 页 404 → **异常**。
+    为什么要分这两种:「没有点阵图」和「查不到点阵图」长得一模一样时,读者无法判断该不该追;
+    2026-10-28 那次(非 SEP 月)就被误判成"解析器坏了",白派了一次修理解析器的活。
     """
     d = date_str.replace("-", "")
     url = f"{FED_SEP_BASE}/fomcprojtabl{d}.htm"
     st, body = http_get(url, ua=UA_WEB)
     if st != 200 or not body:
-        return None
+        # http_get 把 HTTPError 吞成 (None, "HTTP Error 404: ..."),这里把状态码捞回来;
+        # 不动 http_get 本身(派单要求不碰 FETCH 逻辑),只在解析侧还原语义。
+        text = body.decode("utf-8", errors="replace") if body else ""
+        code = st if st is not None else (
+            int(m.group(1)) if (m := re.search(r"HTTP Error (\d{3})", text)) else None)
+        cal = _calendar_has_sep(date_str)
+        # 只有「官方页 404」且「这次会议按日历/月份本来就不发 SEP」才算正常缺失
+        if code == 404 and (cal is False or (cal is None and not _is_sep_month(date_str))):
+            return {
+                "url": url,
+                "parse_status": "no_sep_meeting",
+                "years": None, "median": None, "june": None,
+                "note": (f"{date_str} 不在发布 SEP 的月份(美联储仅在 3/6/9/12 月会议发布点阵图);"
+                         f"官方页 HTTP 404 属预期"),
+            }
+        detail = f"HTTP {code}" if code is not None else f"网络错误({text[:120]})"
+        return {
+            "url": url,
+            "parse_status": "fetch_failed",
+            "years": None, "median": None, "june": None,
+            "note": detail,
+        }
     p = _TableParser()
     p.feed(body.decode("utf-8", errors="replace"))
 
@@ -425,7 +469,13 @@ def fetch_sep_median(date_str):
                 "median": frow[1:6],
                 "june": june_row[1:6] if june_row else [],
             }
-    return None
+    # 页面拿到了但没定位到「年份表头 + federal funds rate 行」→ 与校验失败同属 unverified
+    return {
+        "url": url,
+        "parse_status": "unverified",
+        "years": None, "median": None, "june": None,
+        "note": "页面已取到,但没定位到 SEP 表(年份表头 + federal funds rate 行)",
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -484,7 +534,16 @@ def render_cn(meeting, prev, fred, stmt, sep, fw, out_path):
     L.append("\n【3】点阵图中位数 (SEP, 解析待核验)")
     if sep:
         L.append(f"  数据: {sep['url']}")
-        if sep.get("parse_status") == "unverified":
+        status = sep.get("parse_status")
+        if status == "no_sep_meeting":
+            # 2026-10-31 加:非 3/6/9/12 月会议本来就没有点阵图,别让读者以为是抓取/解析出了问题
+            L.append(f"  点阵图: 本次会议({meeting})不发布 SEP"
+                     f"（美联储仅在 3/6/9/12 月会议发布），非数据缺失")
+        elif status == "fetch_failed":
+            # 与上一种严格区分:这是"该有点阵图但没抓到",数据缺失 → 要追
+            L.append(f"  点阵图: ⚠️ 抓取失败({sep.get('note', '')}, url={sep['url']})"
+                     f" —— 数据缺失，不是「无点阵图」")
+        elif status == "unverified":
             L.append(f"  ⚠️ 解析未通过校验,本次不输出点阵图数值: {sep.get('note', '')}")
         else:
             yrs = sep["years"] or []
@@ -504,7 +563,7 @@ def render_cn(meeting, prev, fred, stmt, sep, fw, out_path):
                     delta = "?"
                 L.append(f"  {y:<10}| {m:<11}| {j:<11}| {delta}")
     else:
-        L.append("  点阵图获取失败")
+        L.append("  点阵图: 状态未知（fetch_sep_median 未返回结果）")
 
     L.append("\n【4】市场隐含概率跳变 (CME FedWatch)")
     if fw and fw.get("status") == "fetched":
