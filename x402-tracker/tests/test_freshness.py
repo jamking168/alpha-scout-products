@@ -6,7 +6,12 @@
   # 或 python3 tests/test_freshness.py
 
 覆盖需求单验收 1（构造假快照：4 天 → 警告；1 天 → 无警告；全无 measured → 不崩）与验收 2 的
-数字口径（用 data/snapshots/2026-11-05.json 复算 → 8 天，且 6 行指标与现文件逐行一致）。
+数字口径（用 data/snapshots/2026-11-05.json 复算 → 8 天，且 6 行指标与**固定基线**
+tests/fixtures/metrics-2026-11-05.txt 逐行一致）。
+
+2026-11-07：原先把 6 行与 data/latest.md 比，而 latest.md 每天被 cron 覆盖 → 日更一跑测试必红，
+测的是「文件有没有被覆盖」而不是代码回归。现改为与 fixture 比（fixture 由同一份快照跑
+render_latest() 生成，不是手抄）。
 测试全部写临时目录，不碰 data/。
 """
 import io
@@ -124,13 +129,13 @@ class FreshnessTests(unittest.TestCase):
 
 
 class RealSnapshotRegression(unittest.TestCase):
-    """用 2026-11-05 的真实快照复算：必须是 8 天，且 6 行指标与现文件逐行一致。"""
+    """用 2026-11-05 的真实快照复算：必须是 8 天，且 6 行指标与固定基线 fixture 逐行一致。"""
 
     def setUp(self):
         self.snap_path = DATA / "snapshots" / "2026-11-05.json"
-        self.latest_path = DATA / "latest.md"
-        if not self.snap_path.exists() or not self.latest_path.exists():
-            self.skipTest("缺 2026-11-05 快照或 latest.md")
+        self.baseline_path = HERE / "fixtures" / "metrics-2026-11-05.txt"
+        if not self.snap_path.exists() or not self.baseline_path.exists():
+            self.skipTest("缺 2026-11-05 快照或基线 fixture")
 
     def test_stale_days_is_eight_on_real_snapshot(self):
         snap = json.loads(self.snap_path.read_text(encoding="utf-8"))
@@ -138,7 +143,13 @@ class RealSnapshotRegression(unittest.TestCase):
         self.assertEqual(max_at, "2026-10-28T12:29:21Z")
         self.assertEqual(days, 8)
 
-    def test_six_metric_lines_match_current_file(self):
+    def test_six_metric_lines_match_baseline_fixture(self):
+        """6 行指标必须与 2026-11-05 的**固定基线**一致。
+
+        基线不再读 data/latest.md（每天被 cron 覆盖 → 必然常红），改读
+        tests/fixtures/metrics-2026-11-05.txt：同一份快照跑 render_latest() 抽出的 6 行，
+        由 tests/fixtures 的生成命令产出、非手抄。
+        """
         snap = json.loads(self.snap_path.read_text(encoding="utf-8"))
         s = snap["summary"]
         max_at, days = trt.settlement_staleness(snap["services"], s["captured_at_utc"])
@@ -147,14 +158,12 @@ class RealSnapshotRegression(unittest.TestCase):
         if len(rows) >= 2:
             prev = rows[-2]
         new_lines = trt.render_latest(s, prev, days, max_at)
-        # 去掉警告段（前两行）与 R2 括号说明，逐行对比老文件
+        # 去掉警告段 + R2 括号说明，只比 "- " 指标行（比较口径与改动前完全一致）
         body = [ln for ln in new_lines if not ln.startswith("> ⚠ 数据源结算层已停更")]
-        body = [ln for ln in body if ln.strip() != "" or True]
-        old = self.latest_path.read_text(encoding="utf-8").splitlines()
-        old_metrics = [ln for ln in old if ln.startswith("- ")]
         new_metrics = [ln.split("（total 较上次")[0] for ln in body if ln.startswith("- ")]
-        self.assertEqual(len(old_metrics), 6)
-        self.assertEqual(new_metrics, old_metrics)
+        expected = [ln for ln in self.baseline_path.read_text(encoding="utf-8").splitlines() if ln.startswith("- ")]
+        self.assertEqual(len(expected), 6)
+        self.assertEqual(new_metrics, expected)
 
 
 if __name__ == "__main__":
