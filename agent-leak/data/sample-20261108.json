@@ -1,0 +1,366 @@
+{
+ "items": 60,
+ "parsed_ok": 57,
+ "leak_files": 1,
+ "rows": [
+  {
+   "repo": "rainbow-me/rainbow",
+   "status": "ok",
+   "rules": 13,
+   "secret_hits": []
+  },
+  {
+   "repo": "future-architect/arch-guidelines",
+   "status": "ok",
+   "rules": 45,
+   "secret_hits": []
+  },
+  {
+   "repo": "FishPiOffical/rhythm",
+   "status": "ok",
+   "rules": 6,
+   "secret_hits": []
+  },
+  {
+   "repo": "AmyangXYZ/reze-mipo",
+   "status": "ok",
+   "rules": 7,
+   "secret_hits": []
+  },
+  {
+   "repo": "kbwo/ccmanager",
+   "status": "ok",
+   "rules": 1,
+   "secret_hits": []
+  },
+  {
+   "repo": "ParkerRex/ai-sdlc",
+   "status": "ok",
+   "rules": 29,
+   "secret_hits": []
+  },
+  {
+   "repo": "NovyWave/NovyWave",
+   "status": "ok",
+   "rules": 0,
+   "secret_hits": []
+  },
+  {
+   "repo": "morapelker/hive",
+   "status": "ok",
+   "rules": 1,
+   "secret_hits": []
+  },
+  {
+   "repo": "shader-slang/slang-rhi",
+   "status": "ok",
+   "rules": 1,
+   "secret_hits": []
+  },
+  {
+   "repo": "pokutuna/mcp-chrome-tabs",
+   "status": "ok",
+   "rules": 14,
+   "secret_hits": []
+  },
+  {
+   "repo": "rinadelph/Rapala",
+   "status": "ok",
+   "rules": 0,
+   "secret_hits": []
+  },
+  {
+   "repo": "jdubray/puffin",
+   "status": "not_json",
+   "size": 2048
+  },
+  {
+   "repo": "zxpsuper/qrcode-with-logos",
+   "status": "ok",
+   "rules": 25,
+   "secret_hits": []
+  },
+  {
+   "repo": "tidepool-heavy-industries/exomonad",
+   "status": "ok",
+   "rules": 0,
+   "secret_hits": []
+  },
+  {
+   "repo": "oriolrius/pki-manager-web",
+   "status": "ok",
+   "rules": 25,
+   "secret_hits": []
+  },
+  {
+   "repo": "DaltonCalford/ScratchBird-legacy",
+   "status": "ok",
+   "rules": 183,
+   "secret_hits": []
+  },
+  {
+   "repo": "jamportz/OpenPBR-viewer",
+   "status": "ok",
+   "rules": 20,
+   "secret_hits": []
+  },
+  {
+   "repo": "hex0xdeadbeef/claude-kit",
+   "status": "ok",
+   "rules": 53,
+   "secret_hits": []
+  },
+  {
+   "repo": "ln2146/EvoCorps",
+   "status": "ok",
+   "rules": 22,
+   "secret_hits": []
+  },
+  {
+   "repo": "achimala/farfield",
+   "status": "ok",
+   "rules": 5,
+   "secret_hits": []
+  },
+  {
+   "repo": "glromeo/esbuild-sass-plugin",
+   "status": "ok",
+   "rules": 2,
+   "secret_hits": []
+  },
+  {
+   "repo": "Dowwie/tasker",
+   "status": "ok",
+   "rules": 10,
+   "secret_hits": []
+  },
+  {
+   "repo": "DimitriGeelen/agentic-engineering-framework",
+   "status": "ok",
+   "rules": 346,
+   "secret_hits": []
+  },
+  {
+   "repo": "matiaszanolli/Auralis",
+   "status": "ok",
+   "rules": 274,
+   "secret_hits": []
+  },
+  {
+   "repo": "alphaplapplap/mcp-memory-service",
+   "status": "ok",
+   "rules": 3,
+   "secret_hits": []
+  },
+  {
+   "repo": "quantified-uncertainty/roast-my-post",
+   "status": "ok",
+   "rules": 60,
+   "secret_hits": []
+  },
+  {
+   "repo": "bashandbone/submod",
+   "status": "not_json",
+   "size": 146
+  },
+  {
+   "repo": "Delphine-L/claude_global",
+   "status": "ok",
+   "rules": 4,
+   "secret_hits": []
+  },
+  {
+   "repo": "alphaplapplap/mcp-memory-service",
+   "status": "ok",
+   "rules": 3,
+   "secret_hits": []
+  },
+  {
+   "repo": "thoughtspot/thoughtspot-agent-skills",
+   "status": "not_json",
+   "size": 2009
+  },
+  {
+   "repo": "ElPuig/EMS",
+   "status": "ok",
+   "rules": 102,
+   "secret_hits": []
+  },
+  {
+   "repo": "depictio/depictio",
+   "status": "ok",
+   "rules": 58,
+   "secret_hits": []
+  },
+  {
+   "repo": "EyeSeeTea/d2-autogen-forms",
+   "status": "ok",
+   "rules": 7,
+   "secret_hits": []
+  },
+  {
+   "repo": "tom-doerr/cc_approver",
+   "status": "ok",
+   "rules": 1,
+   "secret_hits": []
+  },
+  {
+   "repo": "carl10086/ys-powers",
+   "status": "ok",
+   "rules": 32,
+   "secret_hits": []
+  },
+  {
+   "repo": "tomphill/liftingdiarycourse",
+   "status": "ok",
+   "rules": 18,
+   "secret_hits": []
+  },
+  {
+   "repo": "Ambro86/Sonarpad",
+   "status": "ok",
+   "rules": 19,
+   "secret_hits": []
+  },
+  {
+   "repo": "chaojimct/clipboardx",
+   "status": "ok",
+   "rules": 11,
+   "secret_hits": []
+  },
+  {
+   "repo": "eltmon/overdeck",
+   "status": "ok",
+   "rules": 0,
+   "secret_hits": []
+  },
+  {
+   "repo": "Shin-sibainu/ccmux",
+   "status": "ok",
+   "rules": 72,
+   "secret_hits": []
+  },
+  {
+   "repo": "pjastam/ResearchVault",
+   "status": "ok",
+   "rules": 15,
+   "secret_hits": []
+  },
+  {
+   "repo": "kimeisele/vibe-agency",
+   "status": "ok",
+   "rules": 0,
+   "secret_hits": []
+  },
+  {
+   "repo": "nasa-jpl/tasksat",
+   "status": "ok",
+   "rules": 3,
+   "secret_hits": []
+  },
+  {
+   "repo": "XGrowthLab/xhub",
+   "status": "ok",
+   "rules": 3,
+   "secret_hits": []
+  },
+  {
+   "repo": "miles990/multi-agent-workflow",
+   "status": "ok",
+   "rules": 0,
+   "secret_hits": []
+  },
+  {
+   "repo": "Zenobia000/iSpan_linux_basic_course",
+   "status": "ok",
+   "rules": 41,
+   "secret_hits": []
+  },
+  {
+   "repo": "dderyldowney/todowrite",
+   "status": "ok",
+   "rules": 43,
+   "secret_hits": []
+  },
+  {
+   "repo": "ContextLab/orchestrator",
+   "status": "ok",
+   "rules": 111,
+   "secret_hits": []
+  },
+  {
+   "repo": "flanliulf/build-genui-agent-with-langgraph-and-claudecode",
+   "status": "ok",
+   "rules": 15,
+   "secret_hits": []
+  },
+  {
+   "repo": "miskibin/py-draughts",
+   "status": "ok",
+   "rules": 2,
+   "secret_hits": []
+  },
+  {
+   "repo": "tommasobbianchi/OrcaSlicer-Model-Search-Plugin",
+   "status": "ok",
+   "rules": 0,
+   "secret_hits": []
+  },
+  {
+   "repo": "OmerZeyveli/kinglet-unity",
+   "status": "ok",
+   "rules": 0,
+   "secret_hits": []
+  },
+  {
+   "repo": "HsuanYuLee/polaris",
+   "status": "ok",
+   "rules": 41,
+   "secret_hits": []
+  },
+  {
+   "repo": "zabiny/klabis",
+   "status": "ok",
+   "rules": 176,
+   "secret_hits": []
+  },
+  {
+   "repo": "rlcurrall/aide",
+   "status": "ok",
+   "rules": 4,
+   "secret_hits": []
+  },
+  {
+   "repo": "VirtoCommerce/ai-tools",
+   "status": "ok",
+   "rules": 284,
+   "secret_hits": [
+    "kv-secret"
+   ]
+  },
+  {
+   "repo": "sunqb/ccsdk",
+   "status": "ok",
+   "rules": 25,
+   "secret_hits": []
+  },
+  {
+   "repo": "STRRL/shell-now",
+   "status": "ok",
+   "rules": 4,
+   "secret_hits": []
+  },
+  {
+   "repo": "CesarBallardini/ansible-devops-workstation",
+   "status": "ok",
+   "rules": 17,
+   "secret_hits": []
+  },
+  {
+   "repo": "arkanwolfshade/MythosMUD",
+   "status": "ok",
+   "rules": 6,
+   "secret_hits": []
+  }
+ ]
+}

@@ -1,0 +1,32 @@
+{
+ "summary": {
+  "owner": "supabase",
+  "repos_scanned": 25,
+  "config_files_present": 3,
+  "files_with_secret": 0,
+  "measured_at_utc": "2026-11-08T05:06:36Z"
+ },
+ "rows": [
+  {
+   "repo": "supabase/supabase",
+   "path": ".claude/settings.json",
+   "status": "present",
+   "size": 866,
+   "secrets": []
+  },
+  {
+   "repo": "supabase/supabase",
+   "path": ".mcp.json",
+   "status": "present",
+   "size": 115,
+   "secrets": []
+  },
+  {
+   "repo": "supabase/supabase-js",
+   "path": ".cursor/mcp.json",
+   "status": "present",
+   "size": 23,
+   "secrets": []
+  }
+ ]
+}
