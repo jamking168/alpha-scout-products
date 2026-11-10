@@ -1,6 +1,20 @@
 # x402 数据源状态（重要：2026-10-28 起结算层停更）
 
-最后核对：2026-11-05 01:40 CST ｜ 核对人：alpha-scout
+最后核对：2026-11-11 01:1x CST ｜ 核对人：alpha-scout
+
+## 🔻 2026-11-11 裁决：x402 降级为「月度复核」，不再是主变现方向
+
+预设条件「若 2026-11-10 结算层仍未恢复则降级」已触发，且实测未恢复：
+
+- `series.jsonl` 末条 `settlement_stale_days = 13`、`settlement_max_last_at = 2026-10-28T12:29:21Z`（14 天无新结算）。
+- 目录层仍在动（`listed_total 900`、`measured 765`），但 `30d 成交 $309,902.94` 与 11-05 的 $310,836 基本同值 —— 因为是同一批存量，不是走平。
+
+处置：
+
+1. **日抓取脚本保留**（纯脚本、零 LLM 成本，只维护目录层增长/付费服务占比这两个不依赖结算层的口径）。
+2. **不再用它的成交额趋势做任何判断**；只保留两条结构结论：付费服务占比约 49%、可信需求（top1<0.5）约 24%。
+3. 复核节奏改为**每月一次**（下次 2026-12-11 日终作业），恢复条件是 `settlement_stale_days <= 3`。
+4. 主变现方向不押 x402：可信需求 $75k/30d 全市场体量太小，按 30 天全站成交算年化约 $0.9M 的可寻址池，分不到我们身上。
 
 ## 结论
 
@@ -34,7 +48,8 @@ python3 ~/.hermes/profiles/alpha-scout/cache/scratch/x402_freshness_probe.py
 
 ## 待办（代码，下次派单）
 
-`x402_revenue_track.py` 目前只记录数据、不校验新鲜度，所以停更 8 天期间它每晚都「成功」。
-应加一条断言：若 `max(last_settlement_at)` 距今 > 3 天，在 `data/latest.md` 顶部写
-`> ⚠ 数据源停更 N 天（最后结算 YYYY-MM-DD），本快照不代表近期资金流`，并在退出码里带一个 warning 标记，
-让日终作业能直接读到，而不是靠人去比昨天和今天的数字。
+✅ **2026-11-11 已实现并验证**：`x402_revenue_track.py` 现在写入 `settlement_max_last_at` 与
+`settlement_stale_days`，`latest.md` 顶部自动出现「数据源停更 N 天」告警行；
+固定基线回归在 `tests/test_freshness.py`（9 项全通过，`python3 -m unittest discover -s x402-tracker/tests`）。
+原诉求（保留备查）：若 `max(last_settlement_at)` 距今 > 3 天，在 `data/latest.md` 顶部写
+`> ⚠ 数据源停更 N 天（最后结算 YYYY-MM-DD），本快照不代表近期资金流`，并在退出码里带一个 warning 标记。
